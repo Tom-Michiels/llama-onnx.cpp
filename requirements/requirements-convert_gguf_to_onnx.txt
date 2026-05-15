@@ -1,0 +1,5 @@
+numpy>=1.25
+gguf>=0.1.0
+onnx>=1.16
+# onnxruntime is only needed to *run* / test the exported model, not to export.
+onnxruntime>=1.18
