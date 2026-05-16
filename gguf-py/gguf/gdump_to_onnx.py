@@ -66,14 +66,33 @@ def _ggml_shape_to_logical(ne: list[int]) -> list[int]:
 class Translator:
     OPSET = 17
 
-    def __init__(self, dump: gdump.GraphDump):
+    def __init__(self, dump: gdump.GraphDump, *, weight_dtype: str = "float16"):
         self.dump = dump
+        # Weights from quantised GGUF tensors are dequantised to float32 on
+        # load (see gdump._decode_data); we cast them to ``weight_dtype``
+        # before stamping them as ONNX initializers. Float16 is the default
+        # because a fp32 copy of a real-size LLM doesn't usually fit on
+        # consumer hardware, and most ONNX runtimes execute fp16 natively.
+        # The original ggml type is preserved as TensorProto.doc_string so
+        # downstream tools can still see how the weights were stored.
+        wd = weight_dtype.lower()
+        if wd in ("float16", "fp16", "f16"):
+            self._weight_np_dtype = np.dtype("float16")
+            self._compute_onnx_dtype = TensorProto.FLOAT16
+        elif wd in ("float32", "fp32", "f32"):
+            self._weight_np_dtype = np.dtype("float32")
+            self._compute_onnx_dtype = TensorProto.FLOAT
+        else:
+            raise ValueError(f"weight_dtype must be float16 or float32, got {weight_dtype!r}")
         self.nodes: list[onnx.NodeProto] = []
         self.initializers: list[onnx.TensorProto] = []
         self.inputs: list[onnx.ValueInfoProto] = []
         self.outputs: list[onnx.ValueInfoProto] = []
         # Map from gdump tensor index -> ONNX value name that holds it.
         self.value: dict[int, str] = {}
+        # Original ggml type per ONNX initializer name (recorded for the
+        # model-level metadata + per-tensor doc_string).
+        self._original_dtypes: dict[str, str] = {}
         self._name_counter = 0
         # Detect which tensors are actually consumed (so we can prune unused
         # inputs like inp_embd, when the token path is selected).
@@ -113,6 +132,40 @@ class Translator:
     def _const_i64(self, hint: str, values: list[int]) -> str:
         return self._const(hint, np.array(values, dtype=np.int64))
 
+    def _to_compute(self, value_name: str, hint: str) -> str:
+        """Insert a Cast to the chosen activation dtype (matches weight_dtype).
+        Used at the boundaries of explicitly-fp32 regions like RMSNorm."""
+        return self._emit("Cast", [value_name], hint, to=self._compute_onnx_dtype)
+
+    def _add_weight_initializer(
+        self, t: gdump.Tensor, *,
+        transpose: bool = False, name_hint: str | None = None, bind_value: bool = True,
+    ) -> str:
+        """Cast a dequantised weight to weight_dtype, add it as an ONNX
+        initializer, and stamp the original ggml type on its doc_string.
+
+        Set ``bind_value=False`` when this is an auxiliary copy (e.g. a
+        pre-transposed initializer used by a single MatMul) — in that case
+        we don't replace ``self.value[t.index]``, so other consumers of
+        the same weight still see the canonical untransposed initializer.
+        """
+        arr = t.data
+        if transpose:
+            arr = np.ascontiguousarray(arr.T)
+        arr = arr.astype(self._weight_np_dtype, copy=False)
+        name = self._fresh(name_hint or t.name)
+        tp = numpy_helper.from_array(arr, name=name)
+        try:
+            orig = gdump.GgmlType(t.dtype).name
+        except ValueError:
+            orig = f"type_{t.dtype}"
+        tp.doc_string = f"original_ggml_type={orig}"
+        self.initializers.append(tp)
+        self._original_dtypes[name] = orig
+        if bind_value:
+            self.value[t.index] = name
+        return name
+
     # -- top level ------------------------------------------------------
 
     def translate(self) -> onnx.ModelProto:
@@ -145,6 +198,26 @@ class Translator:
         opset = helper.make_opsetid("", self.OPSET)
         m = helper.make_model(graph, opset_imports=[opset], producer_name="llama-onnx.cpp")
         m.ir_version = 8
+
+        # Stamp metadata so downstream tooling can see what we did. ONNX
+        # provides two well-known surfaces:
+        #   - model.metadata_props (model-level free-form key/value)
+        #   - TensorProto.doc_string (per-initializer free-form string)
+        # We populate both with the original ggml type so a reader can
+        # always recover how each weight was stored.
+        from collections import Counter
+        type_counts = Counter(self._original_dtypes.values())
+        type_summary = ",".join(f"{k}:{v}" for k, v in sorted(type_counts.items()))
+        for k, v in [
+            ("llama_onnx.architecture", self.dump.arch),
+            ("llama_onnx.weight_dtype", str(self._weight_np_dtype)),
+            ("llama_onnx.original_dtype_counts", type_summary),
+            ("llama_onnx.n_tokens", str(self.dump.n_tokens)),
+            ("llama_onnx.n_seqs", str(self.dump.n_seqs)),
+        ]:
+            e = m.metadata_props.add()
+            e.key, e.value = k, v
+
         return m
 
     def _present_layers(self) -> list[str]:
@@ -188,12 +261,16 @@ class Translator:
 
         # Mark outputs.
         if t.is_output:
+            # The logits flow through the graph in compute_dtype (fp16 by
+            # default); cast back to fp32 so downstream tooling gets the
+            # conventional precision regardless of how the weights were stored.
             out = self._reserve("logits")
-            # Identity to give it the canonical name.
-            self.nodes.append(helper.make_node("Identity", [self.value[t.index]], [out], name="logits_out"))
+            self.nodes.append(helper.make_node(
+                "Cast", [self.value[t.index]], [out], name="logits_to_f32",
+                to=TensorProto.FLOAT))
             self.value[t.index] = out
             self.outputs.append(helper.make_tensor_value_info(
-                out, _ggml_type_to_onnx(t.dtype), _ggml_shape_to_logical(t.ne)))
+                out, TensorProto.FLOAT, _ggml_shape_to_logical(t.ne)))
 
     def _handle_leaf(self, t: gdump.Tensor) -> None:
         is_cache = t.name.startswith("cache_k_l") or t.name.startswith("cache_v_l")
@@ -212,11 +289,11 @@ class Translator:
             return
 
         if t.has_data:
-            # Weight initializer.
-            name = self._fresh(t.name)
-            arr = t.data.astype(np.float32) if t.dtype == gdump.GgmlType.BF16 else t.data
-            self.initializers.append(numpy_helper.from_array(arr, name=name))
-            self.value[t.index] = name
+            # Weight initializer. The data was already dequantised to float32
+            # on load (see gdump._decode_data); we now cast to the chosen
+            # weight_dtype and record the original ggml type as metadata so
+            # downstream tools can see how the weights were stored.
+            self._add_weight_initializer(t)
             return
 
         # Otherwise this is a graph input (inp_tokens, positions, masks, ...).
@@ -296,10 +373,10 @@ def _h_scale(tr: Translator, t: gdump.Tensor) -> None:
     # op_params: float scale (f32 at offset 0), float bias (f32 at offset 4).
     scale, bias = t.op_params_f32(0, 2)
     x = tr.src_value(t, 0)
-    s_const = tr._const("scale_const", np.array(scale, dtype=np.float32))
+    s_const = tr._const("scale_const", np.array(scale, dtype=tr._weight_np_dtype))
     scaled = tr._emit("Mul", [x, s_const], "scaled")
     if bias != 0.0:
-        b_const = tr._const("bias_const", np.array(bias, dtype=np.float32))
+        b_const = tr._const("bias_const", np.array(bias, dtype=tr._weight_np_dtype))
         scaled = tr._emit("Add", [scaled, b_const], "scaled_b")
     tr.value[t.index] = scaled
 
@@ -307,22 +384,18 @@ def _h_scale(tr: Translator, t: gdump.Tensor) -> None:
 @_op(gdump.GgmlOp.MUL_MAT)
 def _h_mul_mat(tr: Translator, t: gdump.Tensor) -> None:
     # ggml: result = b @ a.T (a = weight, b = activation)
-    a_name = tr.src_value(t, 0)  # weight or upstream
     b_name = tr.src_value(t, 1)  # activation
-    # If the weight is a constant initializer, we pre-transpose it to avoid
-    # an explicit Transpose node. Otherwise we emit a Transpose at runtime.
     a_t = tr.src(t, 0)
     if a_t.has_data:
-        # Replace the initializer with its transpose.
-        arr = a_t.data
-        arr_t = np.ascontiguousarray(arr.T)
-        # Re-add as a fresh initializer; the old one (a_name) still exists but
-        # is harmless (ONNX prunes unused initializers).
-        a_T_name = tr._const(a_t.name + "_T", arr_t)
+        # Constant weight: pre-transpose so we don't need a Transpose node.
+        # Goes through the central weight pipeline so it carries the original
+        # ggml-type metadata and gets cast to the translator's weight_dtype.
+        a_T_name = tr._add_weight_initializer(a_t, transpose=True, name_hint=a_t.name + "_T", bind_value=False)
         tr.value[t.index] = tr._emit("MatMul", [b_name, a_T_name], t.name or "matmul")
     else:
         # Symbolic weight: transpose at runtime. We transpose the LAST two
         # dims so this works for batched matmul shapes too.
+        a_name = tr.src_value(t, 0)
         a_T = tr._emit("Transpose", [a_name], "wT", perm=[1, 0])
         tr.value[t.index] = tr._emit("MatMul", [b_name, a_T], t.name or "matmul")
 
@@ -386,10 +459,10 @@ def _h_get_rows(tr: Translator, t: gdump.Tensor) -> None:
 
 @_op(gdump.GgmlOp.RMS_NORM)
 def _h_rms_norm(tr: Translator, t: gdump.Tensor) -> None:
-    # op_params: f32 eps at offset 0.
+    # op_params: f32 eps at offset 0. Reduction/reciprocal in fp32 even when
+    # compute is fp16 (matches llama.cpp's behaviour); cast back at the end.
     eps = t.op_params_f32(0, 1)[0]
     x = tr.src_value(t, 0)
-    # Compute in float32 (mirrors ggml's behaviour).
     x_f = tr._emit("Cast", [x], "x_f32", to=TensorProto.FLOAT)
     sq = tr._emit("Mul", [x_f, x_f], "sq")
     ms = tr._emit("ReduceMean", [sq], "ms", axes=[-1], keepdims=1)
@@ -397,8 +470,8 @@ def _h_rms_norm(tr: Translator, t: gdump.Tensor) -> None:
     ms_eps = tr._emit("Add", [ms, eps_c], "ms_eps")
     rms = tr._emit("Sqrt", [ms_eps], "rms")
     inv = tr._emit("Reciprocal", [rms], "inv")
-    out = tr._emit("Mul", [x_f, inv], "rms_normed")
-    tr.value[t.index] = out
+    out_f = tr._emit("Mul", [x_f, inv], "rms_normed")
+    tr.value[t.index] = tr._to_compute(out_f, "rms_normed_cast")
 
 
 @_op(gdump.GgmlOp.RESHAPE)
@@ -557,9 +630,9 @@ def _h_glu(tr: Translator, t: gdump.Tensor) -> None:
 
 def _emit_gelu(tr: "Translator", x: str, hint: str) -> str:
     """Erf-based GELU built from primitive ops (opset 17 has no Gelu)."""
-    inv_sqrt2 = tr._const("inv_sqrt2", np.array(1.0 / math.sqrt(2.0), dtype=np.float32))
-    half = tr._const("half", np.array(0.5, dtype=np.float32))
-    one  = tr._const("one",  np.array(1.0, dtype=np.float32))
+    inv_sqrt2 = tr._const("inv_sqrt2", np.array(1.0 / math.sqrt(2.0), dtype=tr._weight_np_dtype))
+    half = tr._const("half", np.array(0.5, dtype=tr._weight_np_dtype))
+    one  = tr._const("one",  np.array(1.0, dtype=tr._weight_np_dtype))
     arg = tr._emit("Mul", [x, inv_sqrt2], f"{hint}_arg")
     er  = tr._emit("Erf", [arg], f"{hint}_erf")
     one_plus = tr._emit("Add", [er, one], f"{hint}_1pErf")
@@ -575,13 +648,14 @@ def _h_softmax(tr: Translator, t: gdump.Tensor) -> None:
         raise NotImplementedError("SOFT_MAX with ALiBi (max_bias > 0) not supported")
     x = tr.src_value(t, 0)
     if scale != 1.0:
-        s = tr._const("softmax_scale", np.array(scale, dtype=np.float32))
+        s = tr._const("softmax_scale", np.array(scale, dtype=tr._weight_np_dtype))
         x = tr._emit("Mul", [x, s], "scaled_for_softmax")
     if len(t.sources) >= 2:
-        # Optional additive mask (e.g. attention causal mask).
+        # Optional additive mask (e.g. attention causal mask). The mask in
+        # ggml is f32; cast to the compute dtype so it broadcasts cleanly.
         mask = tr.src_value(t, 1)
-        m_f = tr._emit("Cast", [mask], "mask_f32", to=TensorProto.FLOAT)
-        x = tr._emit("Add", [x, m_f], "softmax_masked")
+        m = tr._emit("Cast", [mask], "softmax_mask_cast", to=tr._compute_onnx_dtype)
+        x = tr._emit("Add", [x, m], "softmax_masked")
     tr.value[t.index] = tr._emit("Softmax", [x], t.name or "softmax", axis=-1)
 
 
@@ -697,7 +771,8 @@ def _h_norm(tr: Translator, t: gdump.Tensor) -> None:
     eps_c = tr._const("norm_eps", np.array(eps, dtype=np.float32))
     std = tr._emit("Sqrt", [tr._emit("Add", [var, eps_c], "norm_var_eps")], "norm_std")
     inv = tr._emit("Reciprocal", [std], "norm_inv")
-    tr.value[t.index] = tr._emit("Mul", [centered, inv], t.name or "norm")
+    normed_f = tr._emit("Mul", [centered, inv], "norm_centered_scaled")
+    tr.value[t.index] = tr._to_compute(normed_f, t.name or "norm")
 
 
 @_op(gdump.GgmlOp.SQR)
@@ -715,8 +790,8 @@ def _h_sqrt(tr: Translator, t: gdump.Tensor) -> None:
 def _h_clamp(tr: Translator, t: gdump.Tensor) -> None:
     # op_params: f32 min at +0, f32 max at +4.
     lo, hi = t.op_params_f32(0, 2)
-    lo_c = tr._const("clamp_min", np.array(lo, dtype=np.float32))
-    hi_c = tr._const("clamp_max", np.array(hi, dtype=np.float32))
+    lo_c = tr._const("clamp_min", np.array(lo, dtype=tr._weight_np_dtype))
+    hi_c = tr._const("clamp_max", np.array(hi, dtype=tr._weight_np_dtype))
     tr.value[t.index] = tr._emit("Clip", [tr.src_value(t, 0), lo_c, hi_c],
                                  t.name or "clamp")
 
@@ -865,8 +940,12 @@ def _h_rope_mrope(
     angles = tr._emit("Mul", [pos_per_pair, inv_u], "mrope_angles")
     cos = tr._emit("Cos", [angles], "mrope_cos")
     sin = tr._emit("Sin", [angles], "mrope_sin")
-    cos_b = tr._emit("Unsqueeze", [cos, tr._const_i64("axes_1_mrope", [1])], "mrope_cos_b")
-    sin_b = tr._emit("Unsqueeze", [sin, tr._const_i64("axes_1b_mrope", [1])], "mrope_sin_b")
+    cos_b = tr._to_compute(
+        tr._emit("Unsqueeze", [cos, tr._const_i64("axes_1_mrope", [1])], "mrope_cos_b_f"),
+        "mrope_cos_b")
+    sin_b = tr._to_compute(
+        tr._emit("Unsqueeze", [sin, tr._const_i64("axes_1b_mrope", [1])], "mrope_sin_b_f"),
+        "mrope_sin_b")
 
     # NEOX-style halves split.
     x_resh = tr._emit("Reshape", [x_v, tr._const_i64("mrope_x_shape", [n_tokens, n_head, 2, half])], "mrope_x")
@@ -949,8 +1028,13 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
     cos = tr._emit("Cos", [angles], "rope_cos")
     sin = tr._emit("Sin", [angles], "rope_sin")
     # Make cos/sin broadcastable over n_head: shape [n_tokens, 1, head_dim/2].
-    cos_b = tr._emit("Unsqueeze", [cos, tr._const_i64("axes_1", [1])], "rope_cos_b")
-    sin_b = tr._emit("Unsqueeze", [sin, tr._const_i64("axes_1b", [1])], "rope_sin_b")
+    # Cast to the compute dtype so the downstream Muls don't mix f32 with f16.
+    cos_b = tr._to_compute(
+        tr._emit("Unsqueeze", [cos, tr._const_i64("axes_1", [1])], "rope_cos_b_f"),
+        "rope_cos_b")
+    sin_b = tr._to_compute(
+        tr._emit("Unsqueeze", [sin, tr._const_i64("axes_1b", [1])], "rope_sin_b_f"),
+        "rope_sin_b")
 
     # Reshape x to [n_tokens, n_head, head_dim/2, 2] for NORMAL or
     # [n_tokens, n_head, 2, head_dim/2] for NEOX.
@@ -988,19 +1072,26 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
 
 @_op(gdump.GgmlOp.SET_ROWS)
 def _h_set_rows(tr: Translator, t: gdump.Tensor) -> None:
-    # ggml: set_rows(target=src[2], data=src[0], idxs=src[1])
+    # ggml: set_rows(target=src[2], data=src[0], idxs=src[1]). In ggml this
+    # is in-place: subsequent reads of `target` see the new values. ONNX is
+    # functional, so we emit a ScatterND that produces a fresh tensor and
+    # *redirect* the value binding for `target`'s gdump index to that fresh
+    # tensor. Any later VIEW/PERMUTE that references the same leaf then
+    # picks up the scattered version.
     data = tr.src_value(t, 0)
     idx  = tr.src_value(t, 1)
     tgt  = tr.src_value(t, 2)
-    # Use ScatterND. Indices need shape [N, 1] for a 2D target.
-    # The dtype of the target may differ from the data — cast first.
+    tgt_idx = t.sources[2]
     tgt_t = tr.src(t, 2)
     data_t = tr.src(t, 0)
     if data_t.dtype != tgt_t.dtype:
         data = tr._emit("Cast", [data], "cast_to_cache", to=_ggml_type_to_onnx(tgt_t.dtype))
     idx_i64 = tr._emit("Cast", [idx], "idx_i64", to=TensorProto.INT64)
     idx_u = tr._emit("Unsqueeze", [idx_i64, tr._const_i64("axes_-1u", [-1])], "idx_u")
-    tr.value[t.index] = tr._emit("ScatterND", [tgt, idx_u, data], t.name or "set_rows")
+    scattered = tr._emit("ScatterND", [tgt, idx_u, data], t.name or "set_rows")
+    tr.value[t.index] = scattered
+    # Redirect future reads of the cache leaf to the scattered tensor.
+    tr.value[tgt_idx] = scattered
 
 
 @_op(gdump.GgmlOp.FLASH_ATTN_EXT)
@@ -1036,19 +1127,21 @@ def _h_flash_attn(tr: Translator, t: gdump.Tensor) -> None:
         repeats[head_axis] = n_rep
         k = tr._emit("Tile", [k, tr._const_i64("tile_kv", repeats)], "k_rep")
         v = tr._emit("Tile", [v, tr._const_i64("tile_kv2", repeats)], "v_rep")
-    # Q is fp32, K/V may be fp16 in the cache. Promote to fp32.
-    k = tr._emit("Cast", [k], "k_f32", to=TensorProto.FLOAT)
-    v = tr._emit("Cast", [v], "v_f32", to=TensorProto.FLOAT)
+    # Bring K and V into the compute dtype so the MatMul has matching types.
+    # The KV cache is stored fp16 in ggml; the activation flow is whatever
+    # weight_dtype the user picked.
+    k = tr._emit("Cast", [k], "k_cast", to=tr._compute_onnx_dtype)
+    v = tr._emit("Cast", [v], "v_cast", to=tr._compute_onnx_dtype)
     # Scores: Q @ K^T  (transpose the last two dims of K).
     perm = list(range(rank))
     perm[-1], perm[-2] = perm[-2], perm[-1]
     kT = tr._emit("Transpose", [k], "kT", perm=perm)
     scores = tr._emit("MatMul", [q, kT], "scores")
-    s_const = tr._const("attn_scale", np.array(scale, dtype=np.float32))
+    s_const = tr._const("attn_scale", np.array(scale, dtype=tr._weight_np_dtype))
     scores = tr._emit("Mul", [scores, s_const], "scores_scaled")
     if mask is not None:
-        mask_f32 = tr._emit("Cast", [mask], "mask_f32", to=TensorProto.FLOAT)
-        scores = tr._emit("Add", [scores, mask_f32], "scores_masked")
+        mask_cast = tr._emit("Cast", [mask], "mask_cast", to=tr._compute_onnx_dtype)
+        scores = tr._emit("Add", [scores, mask_cast], "scores_masked")
     attn = tr._emit("Softmax", [scores], "attn_softmax", axis=-1)
     ctx = tr._emit("MatMul", [attn, v], "ctx")
     # ggml flash-attn output ne: [head_dim, n_head, n_tokens, 1]; numpy
@@ -1066,14 +1159,18 @@ def _h_flash_attn(tr: Translator, t: gdump.Tensor) -> None:
 # ----------------------------------------------------------------------
 
 
-def convert(dump_path: str | Path, onnx_path: str | Path, *, external_threshold: int = 1024) -> None:
+def convert(
+    dump_path: str | Path, onnx_path: str | Path, *,
+    weight_dtype: str = "float16",
+    external_threshold: int = 1024,
+) -> None:
     dump_path = Path(dump_path)
     onnx_path = Path(onnx_path)
     logger.info("loading dump: %s", dump_path)
     d = gdump.load(dump_path)
     logger.info("arch=%s n_tokens=%d n_seqs=%d tensors=%d", d.arch, d.n_tokens, d.n_seqs, len(d.tensors))
 
-    tr = Translator(d)
+    tr = Translator(d, weight_dtype=weight_dtype)
     model = tr.translate()
 
     data_location = onnx_path.name + ".data"

@@ -300,24 +300,41 @@ def _read_bytes(f: BinaryIO, n: int) -> bytes:
 
 
 def _decode_data(dtype: int, ne: list[int], nbytes: int, raw: bytes) -> np.ndarray:
-    """Convert raw bytes from the dump into a numpy array with the logical
-    shape (ne reversed — ggml's ne[0] is the fastest-varying dim).
+    """Convert raw tensor bytes from the dump into a numpy array.
+
+    For native float / integer types (F32, F16, F64, I8, I16, I32, I64) we
+    just reinterpret the bytes. For BF16 we widen to float32 (numpy has no
+    BF16 dtype). For any quantised type we use ``gguf.quants.dequantize``
+    to recover a float32 array; the resulting shape is the logical
+    (row-major) shape ``reversed(ne)``.
     """
-    np_shape = list(reversed([d for d in ne if d > 1]))
-    if not np_shape:
-        np_shape = [1]
-    gt = GgmlType(dtype)
+    np_shape = list(reversed([d for d in ne if d > 1])) or [1]
+    try:
+        gt = GgmlType(dtype)
+    except ValueError:
+        gt = None
+
     if gt == GgmlType.BF16:
-        # bf16 widened to float32
         u16 = np.frombuffer(raw, dtype=np.uint16)
         u32 = u16.astype(np.uint32) << 16
-        arr = u32.view(np.float32)
-    else:
-        npt = ggml_dtype_to_numpy(dtype)
-        if npt is None:
-            raise ValueError(f"unsupported tensor dtype {gt} for data decode")
-        arr = np.frombuffer(raw, dtype=npt).copy()
-    return arr.reshape(np_shape)
+        return u32.view(np.float32).reshape(np_shape).copy()
+
+    if gt is not None and gt in (GgmlType.F32, GgmlType.F16, GgmlType.F64,
+                                  GgmlType.I8, GgmlType.I16, GgmlType.I32, GgmlType.I64):
+        npt = _GGML_TO_NUMPY[gt]
+        return np.frombuffer(raw, dtype=npt).copy().reshape(np_shape)
+
+    # Quantised type — defer the actual format constants and quants module
+    # imports to keep gdump.py importable in minimal envs.
+    from .constants import GGMLQuantizationType
+    from . import quants
+    qtype = GGMLQuantizationType(dtype)
+    # quants.dequantize expects the source in its packed shape:
+    # block_shape = (n_elements_in_logical_form_with_ne[0]_replaced_by_packed_size)
+    # quants.quant_shape_to_byte_shape gives us that packed shape.
+    packed_shape = quants.quant_shape_to_byte_shape(tuple(np_shape), qtype)
+    packed = np.frombuffer(raw, dtype=np.uint8).reshape(packed_shape)
+    return quants.dequantize(packed, qtype).astype(np.float32).reshape(np_shape)
 
 
 def load(path: str | Path) -> GraphDump:

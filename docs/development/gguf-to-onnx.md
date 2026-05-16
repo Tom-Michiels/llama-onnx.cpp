@@ -41,9 +41,13 @@ portable `.gdump` file, and a Python script translates the dump to ONNX.
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-onnx-export-dump -j
 
-# Convert.
+# Convert (defaults to float16 weight initializers).
 python convert_gguf_to_onnx.py path/to/model.gguf \
     --outfile path/to/model.onnx
+
+# Use float32 weight initializers instead (larger, but matches fp32 hosts).
+python convert_gguf_to_onnx.py path/to/model.gguf \
+    --outfile path/to/model.onnx --weight-dtype float32
 ```
 
 The driver script finds `llama-onnx-export-dump` under `build/bin/` by
@@ -51,6 +55,47 @@ default; pass `--dumper` to override.
 
 If you want to inspect the intermediate dump, use `--keep-dump` (or run the
 dumper directly).
+
+## Quantised inputs
+
+GGUF tensors of any ggml quantisation type (`Q4_0`, `Q4_K_M`, `Q8_0`, `Q2_K`,
+... — anything `gguf.quants.dequantize` understands) are supported. The
+weights are dequantised to float32 in Python on load and then cast to the
+chosen `--weight-dtype` (float16 by default) before being stamped as ONNX
+initializers. ONNX itself has no representation for ggml's block-quantised
+formats, so we have to widen at the boundary.
+
+Two complementary pieces of metadata record what the source GGUF actually
+contained, so downstream tooling (e.g. a quantisation-aware runtime, an
+inspector, or an analyser) can still see how each weight was originally
+stored:
+
+* The model carries a few `metadata_props` entries:
+  - `llama_onnx.architecture`            — the GGUF `general.architecture`
+  - `llama_onnx.weight_dtype`            — what the ONNX initializers were
+    cast to (`float16` or `float32`)
+  - `llama_onnx.original_dtype_counts`   — a histogram of the original
+    ggml types across all initializers, e.g.
+    `F32:18,Q4_0:14,Q8_0:1`
+* Every `TensorProto` initializer carries its original ggml type on its
+  `doc_string`, like `original_ggml_type=Q4_0`.
+
+The exporter takes care of one subtlety transparently: llama.cpp's CPU
+backend re-packs Q4_0 (and several other quantised types) into a
+SIMD-friendly layout when the model is loaded. The C++ dumper therefore
+reads the canonical GGUF bytes for quantised tensors directly from the
+file (via `gguf_init_from_file`) rather than from the in-memory
+`tensor->data` pointer, which the CPU backend may have rewritten.
+
+## Verifying against `llama_decode`
+
+The dumper accepts a `--fixture <path>` flag that, after writing the
+`.gdump`, runs `llama_decode()` on a deterministic prompt and saves the
+input token IDs together with the reference logits. The companion Python
+module `gguf.gdump_fixture` reads that fixture and synthesises the rest
+of the graph inputs (positions, KV-cache write indices, the causal mask)
+from the gdump's graph structure plus the token count, so the test can
+feed the exact same inputs through onnxruntime and compare.
 
 ## ONNX I/O contract
 

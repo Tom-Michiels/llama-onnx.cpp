@@ -72,6 +72,11 @@ def main() -> int:
     parser.add_argument("--dumper", type=Path, default=None, help="path to llama-onnx-export-dump (auto-detected by default)")
     parser.add_argument("--from-dump", action="store_true", help="treat input as a pre-built .gdump file")
     parser.add_argument("--keep-dump", action="store_true", help="don't delete the intermediate .gdump file")
+    parser.add_argument("--weight-dtype", default="float16",
+                        choices=["float16", "fp16", "f16", "float32", "fp32", "f32"],
+                        help="dtype to use for the ONNX weight initializers (default float16). "
+                             "Quantised GGUF tensors are always dequantised on load; this controls "
+                             "the precision of the resulting initializers.")
     parser.add_argument("--verbose", "-v", action="store_true", help="enable debug logging")
     args = parser.parse_args()
 
@@ -87,19 +92,19 @@ def main() -> int:
     onnx_path = args.outfile or args.input.with_suffix(".onnx")
 
     if args.from_dump:
-        gdump_to_onnx(args.input, onnx_path)
+        gdump_to_onnx(args.input, onnx_path, weight_dtype=args.weight_dtype)
         return 0
 
     dumper = _find_dumper(str(args.dumper) if args.dumper else None)
     if args.keep_dump:
         dump_path = args.input.with_suffix(".gdump")
         _run_dumper(dumper, args.input, dump_path)
-        gdump_to_onnx(dump_path, onnx_path)
+        gdump_to_onnx(dump_path, onnx_path, weight_dtype=args.weight_dtype)
     else:
         with tempfile.TemporaryDirectory() as tmp:
             dump_path = Path(tmp) / (args.input.stem + ".gdump")
             _run_dumper(dumper, args.input, dump_path)
-            gdump_to_onnx(dump_path, onnx_path)
+            gdump_to_onnx(dump_path, onnx_path, weight_dtype=args.weight_dtype)
     return 0
 
 

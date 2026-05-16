@@ -18,6 +18,7 @@
 #include "ggml-cpp.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -135,15 +136,46 @@ struct collected {
 
 // Total number of bytes a tensor's data occupies. Skips unsupported (quantised)
 // types — the Python side currently only handles floating-point coefficients.
-size_t tensor_data_nbytes(const ggml_tensor * t) {
-    return ggml_nbytes(t);
-}
+// On-disk Q4_0 / Q8_0 / Q4_K / ... tensors get re-packed by the CPU backend
+// (see ggml/src/ggml-cpu/repack.cpp) for SIMD-friendly access, so `t->data`
+// no longer matches the canonical GGUF byte layout. For quantised leafs we
+// therefore re-read the original bytes from the GGUF file via the
+// gguf_context. For native float types `t->data` is already canonical.
+struct gguf_data_reader {
+    gguf_context * ctx = nullptr;
+    std::FILE * fp = nullptr;
+    size_t data_offset = 0;
 
-bool is_float_type(ggml_type tt) {
-    return tt == GGML_TYPE_F32 || tt == GGML_TYPE_F16 || tt == GGML_TYPE_BF16 || tt == GGML_TYPE_F64;
-}
+    bool open(const std::string & path) {
+        gguf_init_params p{ /*no_alloc=*/true, /*ctx=*/nullptr };
+        ctx = gguf_init_from_file(path.c_str(), p);
+        if (!ctx) return false;
+        data_offset = gguf_get_data_offset(ctx);
+        fp = std::fopen(path.c_str(), "rb");
+        return fp != nullptr;
+    }
 
-void dump_tensor(std::ofstream & f, ggml_tensor * t, const collected & all, bool is_output, bool include_data) {
+    ~gguf_data_reader() {
+        if (fp) std::fclose(fp);
+        if (ctx) gguf_free(ctx);
+    }
+
+    // Read the canonical bytes for `name` into `buf`. Returns false if the
+    // tensor isn't in this GGUF or has a different size than expected.
+    bool read(const char * name, void * buf, size_t expected_nbytes) const {
+        if (!ctx || !fp) return false;
+        const int64_t id = gguf_find_tensor(ctx, name);
+        if (id < 0) return false;
+        const size_t size = gguf_get_tensor_size(ctx, id);
+        if (size != expected_nbytes) return false;
+        const size_t off = data_offset + gguf_get_tensor_offset(ctx, id);
+        if (std::fseek(fp, (long) off, SEEK_SET) != 0) return false;
+        return std::fread(buf, 1, size, fp) == size;
+    }
+};
+
+void dump_tensor(std::ofstream & f, ggml_tensor * t, const collected & all, bool is_output,
+                 const gguf_data_reader * raw = nullptr) {
     const std::string name = t->name;
     const uint32_t name_len = (uint32_t) name.size();
     write_pod(f, name_len);
@@ -157,10 +189,11 @@ void dump_tensor(std::ofstream & f, ggml_tensor * t, const collected & all, bool
     if (leaf) flags |= FLAG_IS_LEAF;
     if (is_output) flags |= FLAG_IS_OUTPUT;
 
-    // Leafs with backing memory are model weights; leafs without are graph
-    // inputs (token ids, positions, KV-cache slots, ...). Non-leaf nodes
-    // never carry their own data.
-    const bool has_data = leaf && t->data != nullptr && include_data && is_float_type(t->type);
+    // Leafs with backing memory are model weights (any ggml type, including
+    // quantised); leafs without backing memory are graph inputs (token ids,
+    // positions, KV-cache slots, ...). Non-leaf nodes never carry their own
+    // data. The Python side dequantises quantised tensors on load.
+    const bool has_data = leaf && t->data != nullptr;
     if (has_data) flags |= FLAG_HAS_DATA;
     if (leaf && !has_data) flags |= FLAG_IS_INPUT;
 
@@ -193,14 +226,26 @@ void dump_tensor(std::ofstream & f, ggml_tensor * t, const collected & all, bool
     }
 
     if (has_data) {
-        const uint64_t nbytes = (uint64_t) tensor_data_nbytes(t);
+        // ggml_nbytes() returns the actual byte length regardless of quant type.
+        const uint64_t nbytes = (uint64_t) ggml_nbytes(t);
         write_pod(f, nbytes);
+        // For quantised types, t->data may have been re-packed by the CPU
+        // backend for SIMD; read the canonical layout from the GGUF file
+        // instead. Float / integer types are not re-packed, so for them
+        // we can copy t->data directly.
+        const bool quantised = !(t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 ||
+                                 t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F64 ||
+                                 t->type == GGML_TYPE_I8  || t->type == GGML_TYPE_I16 ||
+                                 t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64);
+        if (quantised && raw != nullptr) {
+            std::vector<uint8_t> buf(nbytes);
+            if (raw->read(t->name, buf.data(), nbytes)) {
+                write_bytes(f, buf.data(), nbytes);
+                return;
+            }
+            LOG_WRN("could not read canonical bytes for %s from GGUF; falling back to repacked t->data\n", t->name);
+        }
         write_bytes(f, t->data, nbytes);
-    } else if (leaf && t->data != nullptr && !is_float_type(t->type)) {
-        LOG_WRN("leaf %s has data but unsupported (non-float) type %s; skipping data\n",
-                t->name, ggml_type_name(t->type));
-        const uint64_t nbytes = 0;
-        write_pod(f, nbytes);
     }
 }
 
@@ -216,6 +261,24 @@ int main(int argc, char ** argv) {
     params.n_batch  = 32;
     params.n_ubatch = 32;
     params.n_ctx    = 512;
+
+    // ``--fixture <path>``: after dumping the graph, also run a real
+    // llama_decode() with deterministic input tokens and serialise the
+    // (post-decode) inputs the graph consumes plus the reference logits.
+    // The Python side can then feed those exact inputs through onnxruntime
+    // and compare logits — that's the bit-for-bit verification harness.
+    std::string fixture_path;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (std::string(argv[i]) == "--fixture") {
+            fixture_path = argv[i + 1];
+            // Remove this pair from argv so common_params_parse doesn't see it.
+            for (int j = i; j + 2 <= argc; j++) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            break;
+        }
+    }
 
     common_init();
 
@@ -303,18 +366,90 @@ int main(int argc, char ** argv) {
     LOG_INF("dumping %llu tensors to %s\n",
             (unsigned long long) n_tensors, params.out_file.c_str());
 
+    // Open the GGUF a second time so we can read the canonical (non-repacked)
+    // bytes for any quantised tensors.
+    gguf_data_reader raw;
+    if (!raw.open(params.model.path)) {
+        LOG_WRN("could not open %s for raw tensor reads; quantised weights may be re-packed\n",
+                params.model.path.c_str());
+    }
+
     size_t total_bytes_written = 0;
     for (size_t i = 0; i < all.tensors.size(); i++) {
         ggml_tensor * t = all.tensors[i];
         const bool is_output = (t == output_node);
-        dump_tensor(f, t, all, is_output, /*include_data=*/true);
+        dump_tensor(f, t, all, is_output, &raw);
 
-        if (all.is_leaf(t) && t->data != nullptr && is_float_type(t->type)) {
-            total_bytes_written += tensor_data_nbytes(t);
+        if (all.is_leaf(t) && t->data != nullptr) {
+            total_bytes_written += ggml_nbytes(t);
         }
     }
 
     f.flush();
     LOG_INF("done: %zu bytes of float weight data written\n", total_bytes_written);
+
+    // -------------------- optional verification fixture --------------------
+
+    if (!fixture_path.empty()) {
+        // Build a deterministic prompt: tokens [0, 1, 2, ..., n_tokens-1] mod
+        // vocab_size, in a single sequence. That keeps the test reproducible
+        // and works even with the "no_vocab" tokenizer the synthetic GGUFs
+        // use.
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        std::vector<llama_token> tokens(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            tokens[i] = (llama_token)(i % (uint32_t) n_vocab);
+        }
+
+        llama_batch batch = llama_batch_init((int32_t) n_tokens, /*embd=*/0, /*n_seq_max=*/1);
+        batch.n_tokens = (int32_t) n_tokens;
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            batch.token   [i] = tokens[i];
+            batch.pos     [i] = (llama_pos) i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id  [i][0] = 0;
+            batch.logits  [i] = 1;  // ask for logits at every position
+        }
+
+        LOG_INF("running llama_decode for fixture: n_tokens=%u\n", n_tokens);
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERR("llama_decode failed\n");
+            return 1;
+        }
+
+        // Open the fixture file.
+        std::ofstream fx(fixture_path, std::ios::binary);
+        if (!fx.is_open()) {
+            LOG_ERR("cannot open fixture file %s\n", fixture_path.c_str());
+            return 1;
+        }
+
+        constexpr uint32_t FIXTURE_MAGIC = 0x54584647u; // "GFXT"
+        constexpr uint32_t FIXTURE_VERSION = 2;
+        write_pod(fx, FIXTURE_MAGIC);
+        write_pod(fx, FIXTURE_VERSION);
+        write_pod(fx, n_tokens);
+        write_pod(fx, (uint32_t) n_vocab);
+
+        // The token IDs we fed in (the Python side synthesises the rest of
+        // the graph's inputs — positions, KV-cache indices, the causal mask
+        // — from these and the gdump's graph structure).
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            const int32_t tok = (int32_t) batch.token[i];
+            write_pod(fx, tok);
+        }
+
+        // Reference logits: contiguous [n_tokens, n_vocab] fp32 array (we
+        // requested logits at every position).
+        const float * logits = llama_get_logits(ctx);
+        const uint64_t logits_nbytes = (uint64_t) n_tokens * (uint64_t) n_vocab * sizeof(float);
+        write_pod(fx, logits_nbytes);
+        write_bytes(fx, logits, logits_nbytes);
+
+        llama_batch_free(batch);
+        fx.flush();
+        LOG_INF("wrote fixture: %s (%u tokens, %d-vocab logits)\n",
+                fixture_path.c_str(), n_tokens, n_vocab);
+    }
     return 0;
 }
