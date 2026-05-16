@@ -228,17 +228,15 @@ class TestOnnxExportPipeline(unittest.TestCase):
             (onnx_logits,) = sess.run(["logits"], feeds)
             self.assertEqual(onnx_logits.shape, fx.logits.shape)
 
-            # Compare cosine similarity per token row — that's the right
-            # metric when weights are random and absolute magnitudes are
-            # arbitrary, while the directional agreement still validates
-            # the graph structure end-to-end.
+            # With fp32 weights the two paths agree bitwise modulo fp32
+            # rounding (sums of products in slightly different orders), so
+            # we can assert tight absolute & cosine tolerances.
             from numpy.linalg import norm
             cos = (onnx_logits * fx.logits).sum(axis=-1) / (norm(onnx_logits, axis=-1) * norm(fx.logits, axis=-1) + 1e-12)
-            # The last token has the most attention context and is the most
-            # sensitive; the first token is a single-position attention so
-            # it's the most stable.
-            self.assertGreater(cos[0], 0.5,
-                f"first-token cosine similarity too low: {cos[0]:.3f}")
+            self.assertGreater(cos.min(), 0.999,
+                f"per-row cosine min too low: {cos.min():.4f}")
+            self.assertLess(np.abs(onnx_logits - fx.logits).max(), 5e-3,
+                "max abs diff between ONNX and llama_decode logits exceeds 5e-3")
 
 
 if __name__ == "__main__":

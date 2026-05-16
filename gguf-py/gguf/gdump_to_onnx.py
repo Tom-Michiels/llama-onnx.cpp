@@ -1121,12 +1121,38 @@ def _h_flash_attn(tr: Translator, t: gdump.Tensor) -> None:
     n_head_kv = k_t.ne[2]
     if n_head != n_head_kv:
         n_rep = n_head // n_head_kv
-        # Repeat along the head axis (axis 0 for our rank-3 layout, axis 1 for rank-4).
-        repeats = [1] * rank
-        head_axis = rank - 3  # 0 if rank==3 else 1
-        repeats[head_axis] = n_rep
-        k = tr._emit("Tile", [k, tr._const_i64("tile_kv", repeats)], "k_rep")
-        v = tr._emit("Tile", [v, tr._const_i64("tile_kv2", repeats)], "v_rep")
+        # GQA expansion: each KV head is shared by n_rep consecutive Q heads.
+        # A plain ONNX Tile would interleave (-> [H0, H1, H0, H1, ...]); we need
+        # consecutive repetition (-> [H0, H0, H1, H1, ...]). The standard
+        # unsqueeze+tile+reshape trick does that: insert a fresh axis right
+        # after the head axis, tile that axis by n_rep, then fold it back in.
+        head_axis = rank - 3  # 0 for rank-3 inputs, 1 for rank-4
+        u_axis = head_axis + 1
+        u_axes = tr._const_i64("gqa_u_axes", [u_axis])
+        k_u = tr._emit("Unsqueeze", [k, u_axes], "k_unsq")
+        v_u = tr._emit("Unsqueeze", [v, u_axes], "v_unsq")
+        tile_shape = [1] * (rank + 1)
+        tile_shape[u_axis] = n_rep
+        k_t = tr._emit("Tile", [k_u, tr._const_i64("gqa_tile", tile_shape)], "k_tile")
+        v_t = tr._emit("Tile", [v_u, tr._const_i64("gqa_tile2", tile_shape)], "v_tile")
+        # Fold the new axis back into the head axis: shape stays rank, but
+        # head_axis now has n_head_kv * n_rep == n_head entries.
+        # Build the target shape dynamically from the input shape so the batch
+        # dimensions stay symbolic.
+        shape_in = tr._emit("Shape", [k], "k_shape")
+        # head_axis dim becomes n_head; others unchanged.
+        # We construct it as a Concat of single-element slices.
+        parts = []
+        for ax in range(rank):
+            if ax == head_axis:
+                parts.append(tr._const_i64("gqa_new_head", [n_head]))
+            else:
+                start = tr._const_i64(f"gqa_ax_{ax}_s", [ax])
+                end   = tr._const_i64(f"gqa_ax_{ax}_e", [ax + 1])
+                parts.append(tr._emit("Slice", [shape_in, start, end], f"gqa_dim_{ax}"))
+        new_shape = tr._emit("Concat", parts, "gqa_new_shape", axis=0)
+        k = tr._emit("Reshape", [k_t, new_shape], "k_rep")
+        v = tr._emit("Reshape", [v_t, new_shape], "v_rep")
     # Bring K and V into the compute dtype so the MatMul has matching types.
     # The KV cache is stored fp16 in ggml; the activation flow is whatever
     # weight_dtype the user picked.
