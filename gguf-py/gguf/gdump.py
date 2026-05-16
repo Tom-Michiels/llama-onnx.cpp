@@ -44,8 +44,8 @@ class GgmlType(IntEnum):
     I64 = 27
 
 
-# Mirror of ggml.h's enum ggml_op. We define names for the ops we know how
-# to translate; unknown ops are kept as their integer enum value.
+# Mirror of ggml.h's enum ggml_op. Values match the on-disk enum exactly so
+# we can interpret raw bytes from the dump file; the C++ side never remaps.
 class GgmlOp(IntEnum):
     NONE = 0
     DUP = 1
@@ -98,9 +98,51 @@ class GgmlOp(IntEnum):
     ROPE = 48
     ROPE_BACK = 49
     CLAMP = 50
-    UNARY = 70  # composite, see GgmlUnaryOp; op_params[0] picks the variant
+    CONV_TRANSPOSE_1D = 51
+    IM2COL = 52
+    IM2COL_BACK = 53
+    IM2COL_3D = 54
+    CONV_2D = 55
+    CONV_3D = 56
+    CONV_2D_DW = 57
+    CONV_TRANSPOSE_2D = 58
+    POOL_1D = 59
+    POOL_2D = 60
+    POOL_2D_BACK = 61
+    UPSCALE = 62
+    PAD = 63
+    PAD_REFLECT_1D = 64
+    ROLL = 65
+    ARANGE = 66
+    TIMESTEP_EMBEDDING = 67
+    ARGSORT = 68
+    TOP_K = 69
+    LEAKY_RELU = 70
+    TRI = 71
+    FILL = 72
     FLASH_ATTN_EXT = 73
-    GLU = 95  # composite for fused activations (SwiGLU etc.)
+    FLASH_ATTN_BACK = 74
+    SSM_CONV = 75
+    SSM_SCAN = 76
+    WIN_PART = 77
+    WIN_UNPART = 78
+    GET_REL_POS = 79
+    ADD_REL_POS = 80
+    RWKV_WKV6 = 81
+    GATED_LINEAR_ATTN = 82
+    RWKV_WKV7 = 83
+    SOLVE_TRI = 84
+    GATED_DELTA_NET = 85
+    UNARY = 86
+    MAP_CUSTOM1 = 87
+    MAP_CUSTOM2 = 88
+    MAP_CUSTOM3 = 89
+    CUSTOM = 90
+    CROSS_ENTROPY_LOSS = 91
+    CROSS_ENTROPY_LOSS_BACK = 92
+    OPT_STEP_ADAMW = 93
+    OPT_STEP_SGD = 94
+    GLU = 95
 
 
 # ggml unary op variants (op_params[0] when op == UNARY).

@@ -85,12 +85,20 @@ will then surface them as `position_ids`, `out_ids`, etc.).
 
 ## Architecture coverage
 
-| arch              | C++ graph (`src/models/`) | translator |
-| ----------------- | ------------------------- | ---------- |
-| `llama`           | shared with the runtime   | yes, end-to-end on the synthetic test |
-| `qwen` (text)     | shared with the runtime   | most ops covered; the few extra (Q/K bias, sliding-window mask, qkv-fused matmul) need verification on real qwen GGUFs |
-| `qwen2vl`         | shared with the runtime   | the language model goes through the same path; the vision encoder is built by the separate `tools/mtmd` pipeline and is **not** yet dumped — TODO |
-| anything else     | shared with the runtime   | depends on which ops the model uses |
+The synthetic test in `gguf-py/tests/test_onnx_export.py` round-trips a tiny
+random model through the full pipeline (build GGUF → C++ dumper →
+Python translator → onnxruntime forward pass) for each of these. The
+forward pass is checked to produce finite (non-NaN/Inf) logits; bit-exact
+agreement against `llama-cli` running the same GGUF is the next step.
+
+| arch       | end-to-end | notes |
+| ---------- | ---------- | ----- |
+| `llama`    | yes        | GQA, NORMAL-style RoPE |
+| `gemma`    | yes        | input-embedding scaling, GEGLU FFN (built from primitive ops since opset 17 has no `Gelu`) |
+| `qwen3`    | yes        | adds Q/K RMSNorm before RoPE |
+| `qwen3moe` | yes        | TopK expert routing + `MUL_MAT_ID` translated as Gather + broadcast `Mul` + `ReduceSum`; per-batch `GET_ROWS` via `GatherElements` |
+| `qwen2vl`  | yes (LM)   | uses mrope (multimodal RoPE with 4 position sections). The accompanying vision encoder is built by the separate `tools/mtmd` pipeline and is **not** dumped by `llama_graph_reserve` — that's a TODO if/when full multimodal export is needed. |
+| any other  | depends    | adding a new architecture costs nothing on the dump side (C++ graph is the source of truth); the Python translator just needs to know any new ops it pulls in |
 
 Adding a new architecture costs us nothing on the dump side — the C++
 graph builder is the source of truth. The Python side just needs to know
@@ -102,18 +110,27 @@ table is in `gguf-py/gguf/gdump_to_onnx.py` under `_OP_HANDLERS`.
 Implemented today:
 
 ```
-ADD, SUB, MUL, DIV, SCALE, MUL_MAT, GET_ROWS, RMS_NORM, RESHAPE, VIEW,
-CONT, PERMUTE, TRANSPOSE, CPY, GLU (SWIGLU only), ROPE (NORMAL + NEOX),
-SET_ROWS, FLASH_ATTN_EXT (no softcap, no ALiBi)
+ADD, SUB, MUL, DIV, SCALE, SQR, SQRT, SIN, COS, LOG, CLAMP, REPEAT
+MUL_MAT, MUL_MAT_ID, SCALE
+GET_ROWS (Gather + GatherElements), SET_ROWS (ScatterND)
+RMS_NORM, NORM (LayerNorm without affine)
+RESHAPE, VIEW (contiguous slice + squeeze patterns), CONT, PERMUTE,
+TRANSPOSE, CPY (dtype cast), CONCAT
+GLU (SWIGLU / GEGLU / GEGLU_ERF / REGLU)
+ROPE (NORMAL, NEOX, MROPE)
+SOFT_MAX (with optional additive mask + scale)
+UNARY (SILU, RELU, SIGMOID, TANH, NEG, EXP, GELU, GELU_ERF, HARDSWISH, HARDSIGMOID)
+ARGSORT, TOP_K (via TopK; indices cast to int32)
+SUM, SUM_ROWS, MEAN (ReduceSum / ReduceMean along last axis)
+FLASH_ATTN_EXT (no softcap, no ALiBi)
 ```
 
 Not yet implemented (will raise `NotImplementedError`):
 
 ```
-SOFT_MAX standalone, NORM (LayerNorm), GROUP_NORM, ROPE with YaRN scaling
-or mrope, UNARY ops (GELU, ReLU, ...), DIAG_MASK_INF, MUL_MAT_ID (MoE
-routing), CONCAT, CLAMP, SUM/MEAN/ARGMAX along non-trivial axes,
-ADD_ID, FILL, TOP_K, SSM_*, FLASH_ATTN_BACK
+GROUP_NORM, ROPE with YaRN scaling, DIAG_MASK_INF, ADD_ID, FILL,
+SSM_*, FLASH_ATTN_BACK, ROPE_TYPE_VISION / IMROPE, CONV_*, POOL_*,
+strided VIEW patterns beyond contiguous-slice and slot-squeeze.
 ```
 
 Adding one is a small change: an `@_op(GgmlOp.X)` handler that translates

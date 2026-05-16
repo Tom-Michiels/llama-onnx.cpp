@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -328,12 +329,59 @@ def _h_mul_mat(tr: Translator, t: gdump.Tensor) -> None:
 
 @_op(gdump.GgmlOp.GET_ROWS)
 def _h_get_rows(tr: Translator, t: gdump.Tensor) -> None:
-    # ggml: get_rows(data, indices) -> data[indices, :]. ONNX Gather on axis 0.
-    data = tr.src_value(t, 0)
-    idx = tr.src_value(t, 1)
-    # Indices in ggml are i32; Gather wants i64.
+    # ggml GET_ROWS has two distinct flavours sharing the same op:
+    #
+    # (a) "embedding lookup": data is 2D (M, N), indices is 1D (K).
+    #     Result is (K, N). This is a plain ONNX Gather on axis 0.
+    #
+    # (b) "per-batch row pick" (used by MoE for routing): data is (..., B, M)
+    #     and indices is (..., B, K), where ``data.ne[2..3]`` align with
+    #     ``b.ne[1..2]``. Each row of the batch picks K columns. This is
+    #     ONNX GatherElements with axis = row axis.
+    data_t = tr.src(t, 0)
+    idx_t  = tr.src(t, 1)
+    data   = tr.src_value(t, 0)
+    idx    = tr.src_value(t, 1)
     idx_i64 = tr._emit("Cast", [idx], "idx_i64", to=TensorProto.INT64)
-    tr.value[t.index] = tr._emit("Gather", [data, idx_i64], t.name or "gather", axis=0)
+
+    # Flavour (a): all batch dims (ne[1..3] for data, ne[1..2] for idx) are
+    # trivial. Use Gather axis=0.
+    if data_t.ne[2] == 1 and data_t.ne[3] == 1 and idx_t.ne[1] == 1 and idx_t.ne[2] == 1:
+        tr.value[t.index] = tr._emit("Gather", [data, idx_i64], t.name or "gather", axis=0)
+        return
+
+    # Flavour (b): per-batch column pick. Both data and idx may carry trailing
+    # singleton axes that we need to drop so they line up.
+    data_logical = _ggml_shape_to_logical(data_t.ne)
+    idx_logical  = _ggml_shape_to_logical(idx_t.ne)
+
+    def _squeeze_to(arr_name: str, logical: list[int], target_rank: int) -> tuple[str, list[int]]:
+        # Drop any trailing or leading 1-dims until we hit target_rank.
+        while len(logical) > target_rank and logical[0] == 1:
+            logical = logical[1:]
+        while len(logical) > target_rank and logical[-1] == 1:
+            logical = logical[:-1]
+        if logical == _ggml_shape_to_logical([0] * 4):
+            return arr_name, logical
+        return tr._emit("Reshape", [arr_name, tr._const_i64("get_rows_squeeze", logical)], "get_rows_sq"), logical
+
+    # Decide a common rank. For per-batch column pick we expect data and idx
+    # to share all leading axes; idx's trailing axis is the K we pick.
+    target_rank = min(len(data_logical), len(idx_logical))
+    if target_rank < 2:
+        raise NotImplementedError(
+            f"GET_ROWS general case unsupported: data {data_logical}, idx {idx_logical}"
+        )
+    data, data_logical = _squeeze_to(data, data_logical, target_rank)
+    idx_i64, idx_logical = _squeeze_to(idx_i64, idx_logical, target_rank)
+    if data_logical[:-1] != idx_logical[:-1]:
+        raise NotImplementedError(
+            f"GET_ROWS shape mismatch after squeeze: data {data_logical}, idx {idx_logical}"
+        )
+    axis = len(data_logical) - 1
+    tr.value[t.index] = tr._emit(
+        "GatherElements", [data, idx_i64], t.name or "gather_elements", axis=axis,
+    )
 
 
 @_op(gdump.GgmlOp.RMS_NORM)
@@ -364,10 +412,7 @@ def _h_reshape(tr: Translator, t: gdump.Tensor) -> None:
 
 @_op(gdump.GgmlOp.VIEW, gdump.GgmlOp.CONT)
 def _h_view(tr: Translator, t: gdump.Tensor) -> None:
-    # Both VIEW and CONT change layout / contiguity but not values. For
-    # contiguous, same-shape views we can just rebind; for shape changes we
-    # emit a Reshape. (Stride-aware views are NOT handled yet — they're rare
-    # in the prefill graph but appear for the KV cache slices.)
+    # Both VIEW and CONT change layout / contiguity but not values.
     src = tr.src(t, 0)
     src_v = tr.src_value(t, 0)
     target = _ggml_shape_to_logical(t.ne)
@@ -375,16 +420,91 @@ def _h_view(tr: Translator, t: gdump.Tensor) -> None:
     if target == src_logical:
         tr.value[t.index] = src_v
         return
-    # Element count must match to use Reshape.
+    # Same element count -> simple Reshape.
     if int(np.prod(target)) == int(np.prod(src_logical)):
         shape_name = tr._const_i64("view_shape", target)
         tr.value[t.index] = tr._emit("Reshape", [src_v, shape_name], t.name or "view")
         return
-    # Different element count → a real strided view. We don't handle these yet.
+
+    # Strided view: try to express as a contiguous Slice (optionally followed
+    # by a Squeeze) along a single axis. ggml stores the view's byte offset
+    # in op_params[0..7] (size_t).
+    if t.ggml_op == gdump.GgmlOp.VIEW:
+        offset = struct.unpack_from("<Q", t.op_params, 0)[0]
+        if _try_slice_view(tr, t, src, src_v, offset):
+            return
+        if _try_squeeze_view(tr, t, src, src_v, offset):
+            return
+
     raise NotImplementedError(
-        f"VIEW with element-count change ({src_logical} -> {target}) is not "
-        f"supported yet (tensor {t.name!r})"
+        f"VIEW from {src_logical} to {target} "
+        f"(src.ne={src.ne}, view.ne={t.ne}, view.nb={t.nb}, offset={offset if t.ggml_op == gdump.GgmlOp.VIEW else 'n/a'}) "
+        f"is not supported yet (tensor {t.name!r})"
     )
+
+
+def _try_slice_view(tr: "Translator", t: gdump.Tensor, src: gdump.Tensor, src_v: str, offset: int) -> bool:
+    """Slice along exactly one ggml axis where view.ne[ax] < src.ne[ax]."""
+    diffs = [i for i in range(4) if t.ne[i] != src.ne[i]]
+    if len(diffs) != 1:
+        return False
+    ax_ggml = diffs[0]
+    if src.ne[ax_ggml] == 0:
+        return False
+    # Translate offset to a start index along this axis.
+    stride = src.nb[ax_ggml] if src.nb[ax_ggml] else t.nb[0] or 1
+    start = offset // stride
+    end = start + t.ne[ax_ggml]
+    rank = max(t.ndim, src.ndim)
+    ax_np = rank - 1 - ax_ggml
+    if ax_np < 0:
+        return False
+    tr.value[t.index] = tr._emit(
+        "Slice",
+        [src_v,
+         tr._const_i64("slice_starts", [start]),
+         tr._const_i64("slice_ends", [end]),
+         tr._const_i64("slice_axes", [ax_np])],
+        t.name or "view_slice",
+    )
+    return True
+
+
+def _try_squeeze_view(tr: "Translator", t: gdump.Tensor, src: gdump.Tensor, src_v: str, offset: int) -> bool:
+    """View that picks one slot along an axis and drops that axis.
+
+    Pattern: source ne[ax] > 1, view does not have that axis (its remaining
+    axes match the other source axes in order). E.g. (n_tokens, n_used, n_embd)
+    -> (n_tokens, n_embd) by selecting one expert slot.
+    """
+    # Find a ggml axis in source whose size > 1 and which, if removed, would
+    # make the remaining source.ne match the view's ne (axes preserved in order).
+    for ax_drop in range(4):
+        if src.ne[ax_drop] <= 1:
+            continue
+        # Build the candidate source ne with ax_drop removed (insert a 1 at the
+        # end to keep length 4).
+        remaining = [src.ne[i] for i in range(4) if i != ax_drop] + [1]
+        if remaining != t.ne:
+            continue
+        # Found it. Compute slot index from offset.
+        slot = offset // src.nb[ax_drop]
+        rank = src.ndim
+        ax_np = rank - 1 - ax_drop
+        sliced = tr._emit(
+            "Slice",
+            [src_v,
+             tr._const_i64("slice_starts", [slot]),
+             tr._const_i64("slice_ends", [slot + 1]),
+             tr._const_i64("slice_axes", [ax_np])],
+            "view_slot",
+        )
+        tr.value[t.index] = tr._emit(
+            "Squeeze", [sliced, tr._const_i64("squeeze_axes", [ax_np])],
+            t.name or "view_squeeze",
+        )
+        return True
+    return False
 
 
 @_op(gdump.GgmlOp.PERMUTE, gdump.GgmlOp.TRANSPOSE)
@@ -416,39 +536,386 @@ def _h_cpy(tr: Translator, t: gdump.Tensor) -> None:
 
 @_op(gdump.GgmlOp.GLU)
 def _h_glu(tr: Translator, t: gdump.Tensor) -> None:
-    # op_params[0] = ggml_glu_op (SWIGLU = 2). With two non-null sources the
-    # gate is src[0] and the up is src[1].
-    glu_op = t.op_params_i32(2)[0]
-    if glu_op != gdump.GgmlGluOp.SWIGLU.value:
-        raise NotImplementedError(f"GLU variant {gdump.GgmlGluOp(glu_op).name} not implemented")
+    # op_params[0] = ggml_glu_op, op_params[1] = swapped (0 or 1).
+    # With two non-null sources, gate = src[0], up = src[1] (and swapped is
+    # already baked into the source order, so we don't need to swap again).
+    op_i = t.op_params_i32(2)
+    glu_op = op_i[0]
     gate = tr.src_value(t, 0)
     up = tr.src_value(t, 1)
-    sig = tr._emit("Sigmoid", [gate], "silu_sigmoid")
-    silu = tr._emit("Mul", [gate, sig], "silu")
-    tr.value[t.index] = tr._emit("Mul", [silu, up], t.name or "swiglu")
+    if glu_op == gdump.GgmlGluOp.SWIGLU.value:
+        sig = tr._emit("Sigmoid", [gate], "silu_sigmoid")
+        act = tr._emit("Mul", [gate, sig], "silu")
+    elif glu_op in (gdump.GgmlGluOp.GEGLU.value, gdump.GgmlGluOp.GEGLU_ERF.value):
+        act = _emit_gelu(tr, gate, "gelu")
+    elif glu_op == gdump.GgmlGluOp.REGLU.value:
+        act = tr._emit("Relu", [gate], "relu")
+    else:
+        raise NotImplementedError(f"GLU variant {gdump.GgmlGluOp(glu_op).name} not implemented")
+    tr.value[t.index] = tr._emit("Mul", [act, up], t.name or "glu_out")
+
+
+def _emit_gelu(tr: "Translator", x: str, hint: str) -> str:
+    """Erf-based GELU built from primitive ops (opset 17 has no Gelu)."""
+    inv_sqrt2 = tr._const("inv_sqrt2", np.array(1.0 / math.sqrt(2.0), dtype=np.float32))
+    half = tr._const("half", np.array(0.5, dtype=np.float32))
+    one  = tr._const("one",  np.array(1.0, dtype=np.float32))
+    arg = tr._emit("Mul", [x, inv_sqrt2], f"{hint}_arg")
+    er  = tr._emit("Erf", [arg], f"{hint}_erf")
+    one_plus = tr._emit("Add", [er, one], f"{hint}_1pErf")
+    half_x = tr._emit("Mul", [x, half], f"{hint}_xH")
+    return tr._emit("Mul", [half_x, one_plus], hint)
+
+
+@_op(gdump.GgmlOp.SOFT_MAX)
+def _h_softmax(tr: Translator, t: gdump.Tensor) -> None:
+    # op_params: f32 scale at offset 0, f32 max_bias at offset 4.
+    scale, max_bias = t.op_params_f32(0, 2)
+    if max_bias != 0.0:
+        raise NotImplementedError("SOFT_MAX with ALiBi (max_bias > 0) not supported")
+    x = tr.src_value(t, 0)
+    if scale != 1.0:
+        s = tr._const("softmax_scale", np.array(scale, dtype=np.float32))
+        x = tr._emit("Mul", [x, s], "scaled_for_softmax")
+    if len(t.sources) >= 2:
+        # Optional additive mask (e.g. attention causal mask).
+        mask = tr.src_value(t, 1)
+        m_f = tr._emit("Cast", [mask], "mask_f32", to=TensorProto.FLOAT)
+        x = tr._emit("Add", [x, m_f], "softmax_masked")
+    tr.value[t.index] = tr._emit("Softmax", [x], t.name or "softmax", axis=-1)
+
+
+@_op(gdump.GgmlOp.CONCAT)
+def _h_concat(tr: Translator, t: gdump.Tensor) -> None:
+    # op_params[0] = ggml axis (in ggml's ne ordering, fastest-varying = 0);
+    # we flip it for numpy's row-major ordering.
+    ax_ggml = t.op_params_i32(1)[0]
+    rank = max(tr.src(t, 0).ndim, t.ndim)
+    ax_np = rank - 1 - ax_ggml
+    tr.value[t.index] = tr._emit(
+        "Concat", [tr.src_value(t, 0), tr.src_value(t, 1)],
+        t.name or "concat", axis=ax_np,
+    )
+
+
+@_op(gdump.GgmlOp.UNARY)
+def _h_unary(tr: Translator, t: gdump.Tensor) -> None:
+    uop = t.op_params_i32(1)[0]
+    x = tr.src_value(t, 0)
+    if uop == gdump.GgmlUnaryOp.SILU.value:
+        sig = tr._emit("Sigmoid", [x], "silu_sig")
+        tr.value[t.index] = tr._emit("Mul", [x, sig], t.name or "silu")
+        return
+    if uop in (gdump.GgmlUnaryOp.GELU.value, gdump.GgmlUnaryOp.GELU_ERF.value):
+        tr.value[t.index] = _emit_gelu(tr, x, t.name or "gelu")
+        return
+    table = {
+        gdump.GgmlUnaryOp.RELU.value:   ("Relu", {}),
+        gdump.GgmlUnaryOp.SIGMOID.value:("Sigmoid", {}),
+        gdump.GgmlUnaryOp.TANH.value:   ("Tanh", {}),
+        gdump.GgmlUnaryOp.NEG.value:    ("Neg", {}),
+        gdump.GgmlUnaryOp.EXP.value:    ("Exp", {}),
+        gdump.GgmlUnaryOp.HARDSWISH.value: ("HardSwish", {}),
+        gdump.GgmlUnaryOp.HARDSIGMOID.value:("HardSigmoid", {}),
+    }
+    if uop not in table:
+        raise NotImplementedError(f"UNARY op {gdump.GgmlUnaryOp(uop).name} not implemented")
+    op, attrs = table[uop]
+    tr.value[t.index] = tr._emit(op, [x], t.name or op.lower(), **attrs)
+
+
+@_op(gdump.GgmlOp.ARGSORT)
+def _h_argsort(tr: Translator, t: gdump.Tensor) -> None:
+    # op_params[0] = sort_order (0 = ascending, 1 = descending).
+    order = t.op_params_i32(1)[0]
+    x = tr.src_value(t, 0)
+    # Use TopK on the last axis to get a sort. K = last-dim size of input.
+    k = tr.src(t, 0).ne[0]
+    k_const = tr._const_i64("topk_k", [k])
+    vals = tr._fresh("argsort_vals")
+    idxs = tr._fresh("argsort_idxs")
+    tr.nodes.append(helper.make_node(
+        "TopK", [x, k_const], [vals, idxs], axis=-1,
+        largest=1 if order == 1 else 0, sorted=1,
+    ))
+    # ggml returns the indices as i32; ONNX TopK returns i64.
+    tr.value[t.index] = tr._emit("Cast", [idxs], t.name or "argsort", to=TensorProto.INT32)
+
+
+@_op(gdump.GgmlOp.TOP_K)
+def _h_topk(tr: Translator, t: gdump.Tensor) -> None:
+    # op_params[0] = k.
+    k = t.op_params_i32(1)[0]
+    x = tr.src_value(t, 0)
+    k_const = tr._const_i64("topk_k", [k])
+    vals = tr._fresh("topk_vals")
+    idxs = tr._fresh("topk_idxs")
+    tr.nodes.append(helper.make_node(
+        "TopK", [x, k_const], [vals, idxs], axis=-1, largest=1, sorted=1,
+    ))
+    # ggml stores TopK as just indices; ONNX returns both.
+    tr.value[t.index] = tr._emit("Cast", [idxs], t.name or "topk", to=TensorProto.INT32)
+
+
+@_op(gdump.GgmlOp.SUM_ROWS)
+def _h_sum_rows(tr: Translator, t: gdump.Tensor) -> None:
+    # ggml SUM_ROWS reduces along ne[0] (the fastest-varying axis = numpy's
+    # last axis), keeping that axis with size 1.
+    x = tr.src_value(t, 0)
+    tr.value[t.index] = tr._emit("ReduceSum", [x, tr._const_i64("sumrows_axes", [-1])],
+                                 t.name or "sum_rows", keepdims=1)
+
+
+@_op(gdump.GgmlOp.SUM)
+def _h_sum(tr: Translator, t: gdump.Tensor) -> None:
+    # Reduce-sum over all axes, keep dims. (Rare in transformer prefill graphs.)
+    x = tr.src_value(t, 0)
+    tr.value[t.index] = tr._emit("ReduceSum", [x], t.name or "sum", keepdims=1)
+
+
+@_op(gdump.GgmlOp.MEAN)
+def _h_mean(tr: Translator, t: gdump.Tensor) -> None:
+    x = tr.src_value(t, 0)
+    tr.value[t.index] = tr._emit("ReduceMean", [x, tr._const_i64("mean_axes", [-1])],
+                                 t.name or "mean", keepdims=1)
+
+
+@_op(gdump.GgmlOp.NORM)
+def _h_norm(tr: Translator, t: gdump.Tensor) -> None:
+    # ggml NORM = (x - mean(x)) / sqrt(var(x) + eps). LayerNormalization in
+    # ONNX does exactly this, but without learnable affine — and the input
+    # to gemma's `cb(cur, "ffn_norm", ...)` is later multiplied by a weight
+    # *outside* this op, so plain centered/scaled is the right semantics.
+    eps = t.op_params_f32(0, 1)[0]
+    x = tr.src_value(t, 0)
+    x_f = tr._emit("Cast", [x], "norm_x_f32", to=TensorProto.FLOAT)
+    mean = tr._emit("ReduceMean", [x_f], "norm_mean", axes=[-1], keepdims=1)
+    centered = tr._emit("Sub", [x_f, mean], "norm_centered")
+    var = tr._emit("ReduceMean",
+                   [tr._emit("Mul", [centered, centered], "norm_sq")],
+                   "norm_var", axes=[-1], keepdims=1)
+    eps_c = tr._const("norm_eps", np.array(eps, dtype=np.float32))
+    std = tr._emit("Sqrt", [tr._emit("Add", [var, eps_c], "norm_var_eps")], "norm_std")
+    inv = tr._emit("Reciprocal", [std], "norm_inv")
+    tr.value[t.index] = tr._emit("Mul", [centered, inv], t.name or "norm")
+
+
+@_op(gdump.GgmlOp.SQR)
+def _h_sqr(tr: Translator, t: gdump.Tensor) -> None:
+    x = tr.src_value(t, 0)
+    tr.value[t.index] = tr._emit("Mul", [x, x], t.name or "sqr")
+
+
+@_op(gdump.GgmlOp.SQRT)
+def _h_sqrt(tr: Translator, t: gdump.Tensor) -> None:
+    tr.value[t.index] = tr._emit("Sqrt", [tr.src_value(t, 0)], t.name or "sqrt")
+
+
+@_op(gdump.GgmlOp.CLAMP)
+def _h_clamp(tr: Translator, t: gdump.Tensor) -> None:
+    # op_params: f32 min at +0, f32 max at +4.
+    lo, hi = t.op_params_f32(0, 2)
+    lo_c = tr._const("clamp_min", np.array(lo, dtype=np.float32))
+    hi_c = tr._const("clamp_max", np.array(hi, dtype=np.float32))
+    tr.value[t.index] = tr._emit("Clip", [tr.src_value(t, 0), lo_c, hi_c],
+                                 t.name or "clamp")
+
+
+@_op(gdump.GgmlOp.SIN)
+def _h_sin(tr: Translator, t: gdump.Tensor) -> None:
+    tr.value[t.index] = tr._emit("Sin", [tr.src_value(t, 0)], t.name or "sin")
+
+
+@_op(gdump.GgmlOp.COS)
+def _h_cos(tr: Translator, t: gdump.Tensor) -> None:
+    tr.value[t.index] = tr._emit("Cos", [tr.src_value(t, 0)], t.name or "cos")
+
+
+@_op(gdump.GgmlOp.LOG)
+def _h_log(tr: Translator, t: gdump.Tensor) -> None:
+    tr.value[t.index] = tr._emit("Log", [tr.src_value(t, 0)], t.name or "log")
+
+
+@_op(gdump.GgmlOp.REPEAT)
+def _h_repeat(tr: Translator, t: gdump.Tensor) -> None:
+    # ggml REPEAT replicates src to a larger target shape using broadcast
+    # semantics. ONNX Tile takes repeats per axis.
+    src = tr.src(t, 0)
+    src_shape = _ggml_shape_to_logical(src.ne)
+    tgt_shape = _ggml_shape_to_logical(t.ne)
+    # Pad src_shape to the same rank as tgt_shape (broadcast over leading dims).
+    while len(src_shape) < len(tgt_shape):
+        src_shape.insert(0, 1)
+    repeats = [int(tgt_shape[i] // src_shape[i]) for i in range(len(tgt_shape))]
+    repeats_c = tr._const_i64("repeat_counts", repeats)
+    tr.value[t.index] = tr._emit("Tile", [tr.src_value(t, 0), repeats_c],
+                                 t.name or "repeat")
+
+
+@_op(gdump.GgmlOp.MUL_MAT_ID)
+def _h_mul_mat_id(tr: Translator, t: gdump.Tensor) -> None:
+    """ggml MUL_MAT_ID: per-(token, slot) routed matmul for MoE.
+
+    Source layout (numpy):
+      experts: (n_expert, out_features, in_features)
+      acts:    (n_tokens, [1 or n_groups], in_features)
+      ids:     (n_tokens, n_experts_used)              -- int32
+
+    Per ``(t, k)`` pair we want:
+      out[t, k, :] = experts[ids[t, k], :, :] @ acts[t, 0, :]
+
+    We emit that as: gather the expert rows by id (yielding a 4-D tensor),
+    broadcast the activation along the experts_used axis, multiply, and
+    sum over the in_features axis.
+    """
+    experts_t = tr.src(t, 0)
+    acts_t    = tr.src(t, 1)
+    ids_t     = tr.src(t, 2)
+    experts   = tr.src_value(t, 0)
+    acts      = tr.src_value(t, 1)
+    ids       = tr.src_value(t, 2)
+
+    n_expert    = experts_t.ne[2]
+    out_feat    = experts_t.ne[1]
+    in_feat     = experts_t.ne[0]
+    n_tokens    = acts_t.ne[2]
+    # acts.ne[1] is either 1 (gate/up: one activation per token, broadcast over
+    # the n_used selected experts) or n_used (down: a distinct activation per
+    # selected expert, already produced by the SwiGLU). We pick the right
+    # broadcast shape based on which case we're in.
+    n_used_in_acts = acts_t.ne[1]
+    n_used      = ids_t.ne[0]
+
+    # Gather: (n_expert, out, in) along axis=0 with int indices of shape
+    # (n_tokens, n_used) -> (n_tokens, n_used, out, in).
+    ids_i64 = tr._emit("Cast", [ids], "expert_ids_i64", to=TensorProto.INT64)
+    ids_2d = tr._emit("Reshape", [ids_i64, tr._const_i64("ids_shape_2d", [n_tokens, n_used])], "ids_2d")
+    gathered = tr._emit("Gather", [experts, ids_2d], "experts_gathered", axis=0)
+
+    if n_used_in_acts == 1:
+        # gate/up case: acts is (n_tokens, 1, in_feat). Broadcast over n_used.
+        acts_4d = tr._emit("Reshape", [acts, tr._const_i64("acts_shape_4d_b", [n_tokens, 1, 1, in_feat])], "acts_4d_b")
+    else:
+        # down case: acts is (n_tokens, n_used, in_feat). One activation per slot.
+        acts_4d = tr._emit("Reshape", [acts, tr._const_i64("acts_shape_4d_s", [n_tokens, n_used_in_acts, 1, in_feat])], "acts_4d_s")
+    prod = tr._emit("Mul", [gathered, acts_4d], "moe_prod")
+    summed = tr._emit("ReduceSum", [prod, tr._const_i64("moe_sum_axes", [-1])],
+                      "moe_summed", keepdims=0)
+    tr.value[t.index] = summed
+
+
+def _h_rope_mrope(
+    tr: "Translator", t: gdump.Tensor,
+    n_dims: int, sections: list[int],
+    freq_base: float, freq_scale: float, attn_factor: float,
+) -> None:
+    """qwen2vl-style multimodal RoPE.
+
+    The position tensor has ``4 * n_tokens`` entries laid out as four
+    concatenated sections (t, h, w, e). The op_params encode how many of the
+    ``n_dims/2`` rotation pairs come from each section. The rotation itself is
+    NEOX-style (halves split).
+    """
+    x_t = tr.src(t, 0)
+    head_dim = x_t.ne[0]
+    n_head   = x_t.ne[1]
+    n_tokens = x_t.ne[2]
+    assert head_dim == n_dims, "partial mrope not supported"
+    half = head_dim // 2
+    sum_sections = sum(sections)
+    assert sum_sections > 0, "mrope sections cannot be all zero"
+
+    # Build the section index for each pair: which of the four sections it
+    # belongs to. Mirrors ggml_mrope_cache_init.
+    section_idx = []
+    sec_w = sections[0] + sections[1]
+    sec_e = sec_w + sections[2]
+    for i in range(half):
+        sector = i % sum_sections
+        if sector < sections[0]:
+            k = 0
+        elif sector < sec_w:
+            k = 1
+        elif sector < sec_e:
+            k = 2
+        else:
+            k = 3
+        section_idx.append(k)
+    sec_idx_const = tr._const("mrope_section_idx", np.array(section_idx, dtype=np.int64))
+
+    x_v = tr.src_value(t, 0)
+    pos_v = tr.src_value(t, 1)
+    freq_factors_v = tr.src_value(t, 2) if len(t.sources) >= 3 and t.sources[2] != t.sources[0] else None
+
+    # positions is [4, n_tokens] in logical layout (4 sections × n_tokens).
+    pos_f = tr._emit("Cast", [pos_v], "pos_f", to=TensorProto.FLOAT)
+    pos_4xN = tr._emit("Reshape", [pos_f, tr._const_i64("mrope_pos_shape", [4, n_tokens])], "pos_4xN")
+    # Gather per-pair positions: shape [half, n_tokens]
+    pos_per_pair = tr._emit("Gather", [pos_4xN, sec_idx_const], "pos_per_pair", axis=0)
+    # Transpose to [n_tokens, half] for downstream broadcasting.
+    pos_per_pair = tr._emit("Transpose", [pos_per_pair], "pos_per_pair_T", perm=[1, 0])
+
+    inv = 1.0 / (freq_base ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+    inv = inv * float(freq_scale) * float(attn_factor or 1.0)
+    inv_const = tr._const("mrope_inv_freqs", inv.astype(np.float32))
+    inv_u = tr._emit("Unsqueeze", [inv_const, tr._const_i64("axes_0_mrope", [0])], "inv_u")
+    if freq_factors_v is not None:
+        inv_u = tr._emit("Div", [inv_u, tr._emit("Unsqueeze", [freq_factors_v, tr._const_i64("axes0c", [0])], "ff_u")], "inv_u_scaled")
+
+    angles = tr._emit("Mul", [pos_per_pair, inv_u], "mrope_angles")
+    cos = tr._emit("Cos", [angles], "mrope_cos")
+    sin = tr._emit("Sin", [angles], "mrope_sin")
+    cos_b = tr._emit("Unsqueeze", [cos, tr._const_i64("axes_1_mrope", [1])], "mrope_cos_b")
+    sin_b = tr._emit("Unsqueeze", [sin, tr._const_i64("axes_1b_mrope", [1])], "mrope_sin_b")
+
+    # NEOX-style halves split.
+    x_resh = tr._emit("Reshape", [x_v, tr._const_i64("mrope_x_shape", [n_tokens, n_head, 2, half])], "mrope_x")
+    x_e_name, x_o_name = tr._fresh("mrope_x_even"), tr._fresh("mrope_x_odd")
+    tr.nodes.append(helper.make_node("Split", [x_resh], [x_e_name, x_o_name], axis=-2))
+    x_e = tr._emit("Squeeze", [x_e_name, tr._const_i64("axes_-2s_mrope", [-2])], "mrope_x_e")
+    x_o = tr._emit("Squeeze", [x_o_name, tr._const_i64("axes_-2s2_mrope", [-2])], "mrope_x_o")
+    new_e = tr._emit("Sub",
+                     [tr._emit("Mul", [x_e, cos_b], "mrope_ec"),
+                      tr._emit("Mul", [x_o, sin_b], "mrope_os")], "mrope_ne")
+    new_o = tr._emit("Add",
+                     [tr._emit("Mul", [x_e, sin_b], "mrope_es"),
+                      tr._emit("Mul", [x_o, cos_b], "mrope_oc")], "mrope_no")
+    ne_u = tr._emit("Unsqueeze", [new_e, tr._const_i64("axes_-2u_mrope", [-2])], "mrope_ne_u")
+    no_u = tr._emit("Unsqueeze", [new_o, tr._const_i64("axes_-2u2_mrope", [-2])], "mrope_no_u")
+    stacked = tr._fresh("mrope_stacked")
+    tr.nodes.append(helper.make_node("Concat", [ne_u, no_u], [stacked], axis=-2))
+    out = tr._emit("Reshape", [stacked, tr._const_i64("mrope_out_shape", [n_tokens, n_head, head_dim])], t.name or "mrope_out")
+    tr.value[t.index] = out
 
 
 @_op(gdump.GgmlOp.ROPE)
 def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
     # op_params:
-    #   i32[0] = n_past   (unused at exec time)
-    #   i32[1] = n_dims
-    #   i32[2] = mode (0 = NORMAL/NORM, 2 = NEOX, ...)
-    #   i32[3] = n_ctx
-    #   i32[4] = n_ctx_orig
-    #   f32 starts at byte 20: freq_base, freq_scale, ext_factor, attn_factor,
-    #                          beta_fast, beta_slow
+    #   i32[0]      = n_past   (unused at exec time)
+    #   i32[1]      = n_dims
+    #   i32[2]      = mode (0 = NORMAL, 2 = NEOX, 8 = MROPE, ...)
+    #   i32[3]      = n_ctx
+    #   i32[4]      = n_ctx_orig
+    #   f32 at +20  = freq_base, freq_scale, ext_factor, attn_factor,
+    #                 beta_fast, beta_slow
+    #   i32 at +44  = sections[4] (only when MROPE bit is set)
     params_i = t.op_params_i32(5)
     n_dims = params_i[1]
     mode   = params_i[2]
     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow = t.op_params_f32(20, 6)
+    sections = list(struct.unpack_from("<4i", t.op_params, 44))
 
     NORMAL_MODE = 0
-    NEOX_MODE = 2
-    if mode not in (NORMAL_MODE, NEOX_MODE):
+    NEOX_MODE   = 2
+    MROPE_MODE  = 8
+    IMROPE_MODE = 40
+    if mode not in (NORMAL_MODE, NEOX_MODE, MROPE_MODE):
         raise NotImplementedError(f"RoPE mode {mode} not implemented")
     if ext_factor != 0.0:
         raise NotImplementedError("YaRN-style RoPE (ext_factor != 0) not implemented")
+    if mode == MROPE_MODE:
+        _h_rope_mrope(tr, t, n_dims, sections, freq_base, freq_scale, attn_factor)
+        return
 
     x_v = tr.src_value(t, 0)
     pos_v = tr.src_value(t, 1)

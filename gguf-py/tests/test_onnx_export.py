@@ -28,9 +28,13 @@ import numpy as np
 
 if "NO_LOCAL_GGUF" not in os.environ:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gguf import GGUFWriter
 from gguf.gdump_to_onnx import convert as gdump_to_onnx
+from tiny_models import (
+    write_gguf, tiny_llama, tiny_gemma, tiny_qwen3, tiny_qwen3moe, tiny_qwen2vl,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,66 +50,6 @@ def _find_dumper() -> Path | None:
     return None
 
 
-class Hparams:
-    def __init__(self, n_layer, n_embd, n_ff, n_head, n_head_kv, head_dim,
-                 vocab_size, rms_eps, rope_base):
-        self.n_layer = n_layer
-        self.n_embd = n_embd
-        self.n_ff = n_ff
-        self.n_head = n_head
-        self.n_head_kv = n_head_kv
-        self.head_dim = head_dim
-        self.vocab_size = vocab_size
-        self.rms_eps = rms_eps
-        self.rope_base = rope_base
-
-
-def make_random_weights(h: Hparams, *, seed=0, dtype=np.float32) -> dict:
-    rng = np.random.default_rng(seed)
-    def rand(shape):
-        return (rng.standard_normal(shape).astype(np.float32) * 0.05).astype(dtype)
-    weights = {
-        "token_embd.weight":   rand((h.vocab_size, h.n_embd)),
-        "output_norm.weight":  np.ones((h.n_embd,), dtype=dtype),
-    }
-    for il in range(h.n_layer):
-        weights[f"blk.{il}.attn_norm.weight"]   = np.ones((h.n_embd,), dtype=dtype)
-        weights[f"blk.{il}.attn_q.weight"]      = rand((h.n_head * h.head_dim, h.n_embd))
-        weights[f"blk.{il}.attn_k.weight"]      = rand((h.n_head_kv * h.head_dim, h.n_embd))
-        weights[f"blk.{il}.attn_v.weight"]      = rand((h.n_head_kv * h.head_dim, h.n_embd))
-        weights[f"blk.{il}.attn_output.weight"] = rand((h.n_embd, h.n_head * h.head_dim))
-        weights[f"blk.{il}.ffn_norm.weight"]    = np.ones((h.n_embd,), dtype=dtype)
-        weights[f"blk.{il}.ffn_gate.weight"]    = rand((h.n_ff, h.n_embd))
-        weights[f"blk.{il}.ffn_up.weight"]      = rand((h.n_ff, h.n_embd))
-        weights[f"blk.{il}.ffn_down.weight"]    = rand((h.n_embd, h.n_ff))
-    return weights
-
-
-def write_tiny_llama_gguf(path: Path, h: Hparams, weights: dict, *, dtype=np.float32):
-    w = GGUFWriter(path, "llama")
-    w.add_block_count(h.n_layer)
-    w.add_embedding_length(h.n_embd)
-    w.add_feed_forward_length(h.n_ff)
-    w.add_head_count(h.n_head)
-    w.add_head_count_kv(h.n_head_kv)
-    w.add_key_length(h.head_dim)
-    w.add_value_length(h.head_dim)
-    w.add_layer_norm_rms_eps(h.rms_eps)
-    w.add_rope_dimension_count(h.head_dim)
-    w.add_rope_freq_base(h.rope_base)
-    w.add_vocab_size(h.vocab_size)
-    w.add_context_length(64)
-    # llama.cpp's vocab loader insists on tokenizer.ggml.model being present;
-    # "none" tells it to skip tokenizer construction entirely.
-    w.add_tokenizer_model("none")
-    for name, arr in weights.items():
-        w.add_tensor(name, arr.astype(dtype))
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file()
-    w.close()
-
-
 class TestOnnxExportPipeline(unittest.TestCase):
 
     def setUp(self):
@@ -117,14 +61,14 @@ class TestOnnxExportPipeline(unittest.TestCase):
         except ImportError:
             self.skipTest("onnxruntime not installed")
 
-    def _run_pipeline(self, h: Hparams):
-        weights = make_random_weights(h, seed=42)
+    def _run_pipeline(self, model_builder):
+        m = model_builder()
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
-            gguf_path = tmp / "tiny.gguf"
-            dump_path = tmp / "tiny.gdump"
-            onnx_path = tmp / "tiny.onnx"
-            write_tiny_llama_gguf(gguf_path, h, weights)
+            gguf_path = tmp / f"tiny_{m.arch}.gguf"
+            dump_path = tmp / f"tiny_{m.arch}.gdump"
+            onnx_path = tmp / f"tiny_{m.arch}.onnx"
+            write_gguf(gguf_path, m)
 
             env = os.environ.copy()
             env.setdefault("LD_LIBRARY_PATH", str(self.dumper.parent))
@@ -141,9 +85,9 @@ class TestOnnxExportPipeline(unittest.TestCase):
             sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             self.assertIn("logits", {o.name for o in sess.get_outputs()})
 
-            # Build zero-filled inputs and run a forward pass; we just check
-            # that the model accepts the I/O contract and produces finite
-            # outputs. Bitwise-against-llama.cpp comparison is a follow-up.
+            # Zero-filled forward pass: we just check that the model accepts
+            # the I/O contract and produces finite outputs. Bit-exact
+            # comparison against llama.cpp is the next step.
             feeds = {}
             for inp in sess.get_inputs():
                 dt = {"tensor(int64)": np.int64, "tensor(int32)": np.int32,
@@ -151,16 +95,14 @@ class TestOnnxExportPipeline(unittest.TestCase):
                 feeds[inp.name] = np.zeros(inp.shape, dtype=dt)
             outs = sess.run(None, feeds)
             logits = outs[0]
-            self.assertFalse(np.any(np.isnan(logits)), "logits contain NaN")
-            self.assertFalse(np.any(np.isinf(logits)), "logits contain Inf")
+            self.assertFalse(np.any(np.isnan(logits)), f"{m.arch}: logits contain NaN")
+            self.assertFalse(np.any(np.isinf(logits)), f"{m.arch}: logits contain Inf")
 
-    def test_llama_small_gqa(self):
-        h = Hparams(
-            n_layer=2, n_embd=16, n_ff=32,
-            n_head=4, n_head_kv=2, head_dim=4,
-            vocab_size=32, rms_eps=1e-5, rope_base=10000.0,
-        )
-        self._run_pipeline(h)
+    def test_llama(self):    self._run_pipeline(tiny_llama)
+    def test_gemma(self):    self._run_pipeline(tiny_gemma)
+    def test_qwen3(self):    self._run_pipeline(tiny_qwen3)
+    def test_qwen3moe(self): self._run_pipeline(tiny_qwen3moe)
+    def test_qwen2vl(self):  self._run_pipeline(tiny_qwen2vl)
 
 
 if __name__ == "__main__":
