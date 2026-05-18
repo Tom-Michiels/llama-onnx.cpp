@@ -121,3 +121,21 @@ struct clip_cap {
     bool has_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);
+
+// Graph dumping API
+//
+// Provides access to the clip vision/audio compute graph for tools that want
+// to walk the cgraph without actually running it (e.g. the onnx-export-dump
+// tool). The handle keeps the underlying ggml_context alive so the cgraph
+// pointers remain valid until clip_dump_graph_free() is called.
+//
+// Usage:
+//   clip_init() -> clip_ctx
+//   clip_dump_graph_create(ctx_v) -> handle
+//   gf = clip_dump_graph_cgraph(handle)
+//   walk gf->leafs/gf->nodes ...
+//   clip_dump_graph_free(handle)
+struct clip_dump_graph;
+struct clip_dump_graph * clip_dump_graph_create(struct clip_ctx * ctx);
+struct ggml_cgraph     * clip_dump_graph_cgraph(struct clip_dump_graph * dg);
+void                     clip_dump_graph_free  (struct clip_dump_graph * dg);

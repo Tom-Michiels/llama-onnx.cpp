@@ -2939,6 +2939,147 @@ struct clip_cap clip_get_cap(const char * fname) {
     return res;
 }
 
+//
+// graph dump: expose the compute graph so external tools (the onnx-export-dump
+// utility) can walk it without running it.
+//
+// The handle keeps a clip_image_f32_batch (warmup-sized image) and the
+// clip_graph builder alive; the cgraph and tensor pointers live inside the
+// clip_ctx::buf_compute_meta buffer, which itself outlives this handle as
+// long as the clip_ctx outlives it.
+//
+struct clip_dump_graph {
+    clip_image_f32_batch       batch;
+    std::unique_ptr<clip_graph> builder;
+    ggml_cgraph              * gf = nullptr;
+};
+
+struct clip_dump_graph * clip_dump_graph_create(struct clip_ctx * ctx) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    // The clip_image_build_graph machinery allocates from
+    // ctx->buf_compute_meta. Reserve the same buffer size warmup() uses so
+    // the graph build doesn't trip the mem_size assertion.
+    ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+
+    // Build a fake warmup-sized batch: same shape conventions as
+    // clip_model_loader::warmup(). For vision this is a square image at
+    // hparams.warmup_image_size; for audio it's a mel-spectrogram-shaped
+    // pseudo-image.
+    auto * dg = new clip_dump_graph();
+    const auto & hparams = ctx->model.hparams;
+    clip_image_f32_ptr img(clip_image_f32_init());
+    if (ctx->model.modality == CLIP_MODALITY_VISION) {
+        img->nx = hparams.warmup_image_size;
+        img->ny = hparams.warmup_image_size;
+        img->buf.assign((size_t) img->nx * img->ny * 3, 0.0f);
+    } else {
+        img->nx = hparams.warmup_audio_size;
+        img->ny = hparams.n_mel_bins;
+        img->buf.assign((size_t) img->nx * img->ny, 0.0f);
+    }
+    dg->batch.entries.push_back(std::move(img));
+
+    const clip_image_f32 & img_ref = *dg->batch.entries[0];
+
+    // Mirror the projector-dispatch switch from clip_image_build_graph. We
+    // keep the builder alive in the handle so the underlying ggml_context
+    // (which holds the cgraph's metadata) isn't freed under our feet.
+    switch (ctx->proj_type()) {
+        case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_LFM2:
+        case PROJECTOR_TYPE_JANUS_PRO:
+        case PROJECTOR_TYPE_PHI4:
+            dg->builder = std::make_unique<clip_graph_siglip>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_GEMMA3NV:
+            dg->builder = std::make_unique<clip_graph_mobilenetv5>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_GEMMA4V:
+            dg->builder = std::make_unique<clip_graph_gemma4v>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_PIXTRAL:
+        case PROJECTOR_TYPE_LIGHTONOCR:
+            dg->builder = std::make_unique<clip_graph_pixtral>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_DOTS_OCR:
+            dg->builder = std::make_unique<clip_graph_dotsocr>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_QWEN2VL:
+        case PROJECTOR_TYPE_QWEN25VL:
+            dg->builder = std::make_unique<clip_graph_qwen2vl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            dg->builder = std::make_unique<clip_graph_qwen3vl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_MIMOVL:
+            dg->builder = std::make_unique<clip_graph_mimovl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_STEP3VL:
+            dg->builder = std::make_unique<clip_graph_step3vl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_MINICPMV:
+            dg->builder = std::make_unique<clip_graph_minicpmv>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_MINICPMV4_6:
+            dg->builder = std::make_unique<clip_graph_minicpmv4_6>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_INTERNVL:
+            dg->builder = std::make_unique<clip_graph_internvl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+            dg->builder = std::make_unique<clip_graph_nemotron_v2_vl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_LLAMA4:
+            dg->builder = std::make_unique<clip_graph_llama4>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_ULTRAVOX:
+        case PROJECTOR_TYPE_VOXTRAL:
+        case PROJECTOR_TYPE_QWEN2A:
+        case PROJECTOR_TYPE_GLMA:
+        case PROJECTOR_TYPE_MERALION:
+        case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+            dg->builder = std::make_unique<clip_graph_whisper_enc>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_KIMIVL:
+            dg->builder = std::make_unique<clip_graph_kimivl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_PADDLEOCR:
+            dg->builder = std::make_unique<clip_graph_paddleocr>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_KIMIK25:
+            dg->builder = std::make_unique<clip_graph_kimik25>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_COGVLM:
+            dg->builder = std::make_unique<clip_graph_cogvlm>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_HUNYUANOCR:
+        case PROJECTOR_TYPE_HUNYUANVL:
+            dg->builder = std::make_unique<clip_graph_hunyuanocr>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_MLP:
+        case PROJECTOR_TYPE_MLP_NORM:
+        case PROJECTOR_TYPE_LDP:
+        case PROJECTOR_TYPE_LDPV2:
+        case PROJECTOR_TYPE_GLM_EDGE:
+            dg->builder = std::make_unique<clip_graph_llava>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_DEEPSEEKOCR:
+            dg->builder = std::make_unique<clip_graph_deepseekocr>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_LFM2A:
+            dg->builder = std::make_unique<clip_graph_conformer>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_GEMMA4A:
+            dg->builder = std::make_unique<clip_graph_gemma4a>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_GRANITE_SPEECH:
+            dg->builder = std::make_unique<clip_graph_granite_speech>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_GLM4V:
+            dg->builder = std::make_unique<clip_graph_glm4v>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_QWEN3A:
+            dg->builder = std::make_unique<clip_graph_qwen3a>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_YOUTUVL:
+            dg->builder = std::make_unique<clip_graph_youtuvl>(ctx, img_ref); break;
+        case PROJECTOR_TYPE_YASA2:
+            dg->builder = std::make_unique<clip_graph_yasa2>(ctx, img_ref); break;
+        default:
+            LOG_ERR("clip_dump_graph_create: no cgraph builder for proj_type %d\n", (int) ctx->proj_type());
+            delete dg;
+            return nullptr;
+    }
+
+    dg->gf = dg->builder->build();
+    return dg;
+}
+
+struct ggml_cgraph * clip_dump_graph_cgraph(struct clip_dump_graph * dg) {
+    return dg ? dg->gf : nullptr;
+}
+
+void clip_dump_graph_free(struct clip_dump_graph * dg) {
+    delete dg;
+}
+
 struct clip_image_size * clip_image_size_init() {
     struct clip_image_size * load_image_size = new struct clip_image_size();
     load_image_size->width = 448;

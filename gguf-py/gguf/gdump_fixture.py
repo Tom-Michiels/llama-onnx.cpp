@@ -1,23 +1,32 @@
 """Reader / runner for the ``.gfxt`` verification fixtures.
 
 A fixture file is the output of ``llama-onnx-export-dump --fixture <path>``
-and contains:
+(LM fixtures) or ``--vision-fixture <path>`` (vision encoder fixtures), and
+contains:
+
+For LM fixtures (v2 / v3, ``kind="lm"``):
 
 * the input token IDs fed to ``llama_decode()``, and
 * the reference logits llama.cpp computed for those tokens.
 
-The rest of the graph's inputs (positions, KV-cache write indices, the
-causal mask) are not stored in the fixture — they are derived in Python
-from the gdump's graph structure (which input feeds which op) plus the
-token count, so the test is bit-for-bit reproducible without needing
-llama.cpp to expose its post-decode tensor state.
+  The rest of the graph's inputs (positions, KV-cache write indices, the
+  causal mask) are not stored in the fixture — they are derived in Python
+  from the gdump's graph structure (which input feeds which op) plus the
+  token count, so the test is bit-for-bit reproducible without needing
+  llama.cpp to expose its post-decode tensor state.
+
+For vision fixtures (v4, ``kind="vis"``):
+
+* the deterministic input image (random fp32 pixels in HWC layout), and
+* the projected visual features the clip encoder produced for them.
 """
 
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, Optional
 
 import numpy as np
 
@@ -25,15 +34,41 @@ from . import gdump
 
 
 _FIXTURE_MAGIC = 0x54584647  # "GFXT"
-_FIXTURE_VERSION = 2
+_FIXTURE_VERSION_MIN = 2
+_FIXTURE_VERSION_MAX = 4
+
+
+@dataclass
+class Intermediate:
+    """One ggml-side captured intermediate tensor.
+
+    `ne` is the ggml shape (length-4, fastest-varying first). `data` is row-
+    major fp32 with the trailing singleton dims dropped (ready for direct
+    comparison against the ONNX side, which produces row-major arrays).
+    """
+    name: str
+    ne: list[int]
+    data: np.ndarray  # fp32, row-major, shape = list(reversed(ne_nontrivial))
 
 
 @dataclass
 class Fixture:
-    n_tokens: int
-    n_vocab: int
-    token_ids: np.ndarray   # int32, shape (n_tokens,)
-    logits: np.ndarray      # float32, shape (n_tokens, n_vocab)
+    # Discriminator for which fields are populated. LM fixtures (v2 / v3) use
+    # token_ids / logits / intermediates; vision fixtures (v4) use input_pixels
+    # / output_features.
+    kind: Literal["lm", "vision"] = "lm"
+
+    # LM-specific fields.
+    n_tokens: int = 0
+    n_vocab: int = 0
+    token_ids: Optional[np.ndarray] = None    # int32, (n_tokens,)
+    logits: Optional[np.ndarray] = None       # float32, (n_tokens, n_vocab)
+    intermediates: list["Intermediate"] = field(default_factory=list)
+
+    # Vision-specific fields.
+    input_pixels: Optional[np.ndarray] = None      # float32, (H, W, C) by default
+    output_features: Optional[np.ndarray] = None   # float32, encoder output
+    output_name: str = ""
 
 
 def _read_exact(f, n: int) -> bytes:
@@ -43,22 +78,84 @@ def _read_exact(f, n: int) -> bytes:
     return b
 
 
+def _read_shape(f) -> list[int]:
+    (rank,) = struct.unpack("<I", _read_exact(f, 4))
+    dims = list(struct.unpack(f"<{rank}Q", _read_exact(f, rank * 8))) if rank else []
+    return dims
+
+
 def load(path: str | Path) -> Fixture:
     with open(path, "rb") as f:
         magic, version = struct.unpack("<II", _read_exact(f, 8))
         if magic != _FIXTURE_MAGIC:
             raise ValueError(f"bad fixture magic 0x{magic:08x}")
-        if version != _FIXTURE_VERSION:
-            raise ValueError(f"unsupported fixture version {version} (this build understands {_FIXTURE_VERSION})")
-        n_tokens, n_vocab = struct.unpack("<II", _read_exact(f, 8))
-        tokens = np.frombuffer(_read_exact(f, n_tokens * 4), dtype=np.int32).copy()
-        (logits_nbytes,) = struct.unpack("<Q", _read_exact(f, 8))
-        expected = n_tokens * n_vocab * 4
-        if logits_nbytes != expected:
-            raise ValueError(f"logits size mismatch: got {logits_nbytes}, expected {expected}")
-        logits = np.frombuffer(_read_exact(f, logits_nbytes), dtype=np.float32).copy()
-        logits = logits.reshape(n_tokens, n_vocab)
-        return Fixture(n_tokens=n_tokens, n_vocab=n_vocab, token_ids=tokens, logits=logits)
+        if not (_FIXTURE_VERSION_MIN <= version <= _FIXTURE_VERSION_MAX):
+            raise ValueError(f"unsupported fixture version {version} (this build understands "
+                             f"{_FIXTURE_VERSION_MIN}..{_FIXTURE_VERSION_MAX})")
+
+        # v4 introduces an explicit 4-byte kind tag right after the version.
+        # v2 / v3 are LM-only (no tag).
+        if version >= 4:
+            kind_tag = _read_exact(f, 4).rstrip(b"\x00").decode("ascii", errors="replace")
+        else:
+            kind_tag = "lm"
+
+        if kind_tag in ("", "lm"):
+            return _load_lm(f, version)
+        if kind_tag == "vis":
+            return _load_vision(f)
+        raise ValueError(f"unknown fixture kind tag {kind_tag!r}")
+
+
+def _load_lm(f, version: int) -> Fixture:
+    n_tokens, n_vocab = struct.unpack("<II", _read_exact(f, 8))
+    tokens = np.frombuffer(_read_exact(f, n_tokens * 4), dtype=np.int32).copy()
+    (logits_nbytes,) = struct.unpack("<Q", _read_exact(f, 8))
+    expected = n_tokens * n_vocab * 4
+    if logits_nbytes != expected:
+        raise ValueError(f"logits size mismatch: got {logits_nbytes}, expected {expected}")
+    logits = np.frombuffer(_read_exact(f, logits_nbytes), dtype=np.float32).copy()
+    logits = logits.reshape(n_tokens, n_vocab)
+
+    intermediates: list[Intermediate] = []
+    if version >= 3:
+        (n_entries,) = struct.unpack("<I", _read_exact(f, 4))
+        for _ in range(n_entries):
+            (name_len,) = struct.unpack("<I", _read_exact(f, 4))
+            name = _read_exact(f, name_len).decode("utf-8", errors="replace")
+            ne = list(struct.unpack("<4q", _read_exact(f, 32)))
+            (n_elements,) = struct.unpack("<Q", _read_exact(f, 8))
+            data = np.frombuffer(_read_exact(f, n_elements * 4), dtype=np.float32).copy()
+            shape = list(reversed([d for d in ne if d > 1])) or [1]
+            data = data.reshape(shape)
+            intermediates.append(Intermediate(name=name, ne=ne, data=data))
+
+    return Fixture(kind="lm", n_tokens=n_tokens, n_vocab=n_vocab,
+                   token_ids=tokens, logits=logits, intermediates=intermediates)
+
+
+def _load_vision(f) -> Fixture:
+    in_shape = _read_shape(f)
+    in_count = 1
+    for d in in_shape:
+        in_count *= int(d)
+    input_pixels = np.frombuffer(_read_exact(f, in_count * 4), dtype=np.float32).copy()
+    input_pixels = input_pixels.reshape(in_shape)
+
+    (name_len,) = struct.unpack("<I", _read_exact(f, 4))
+    output_name = _read_exact(f, name_len).decode("utf-8", errors="replace")
+
+    out_shape = _read_shape(f)
+    out_count = 1
+    for d in out_shape:
+        out_count *= int(d)
+    output_features = np.frombuffer(_read_exact(f, out_count * 4), dtype=np.float32).copy()
+    output_features = output_features.reshape(out_shape)
+
+    return Fixture(kind="vision",
+                   input_pixels=input_pixels,
+                   output_features=output_features,
+                   output_name=output_name)
 
 
 # --------------------------------------------------------------------------

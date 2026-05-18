@@ -34,6 +34,7 @@ from gguf import GGUFWriter
 from gguf.gdump_to_onnx import convert as gdump_to_onnx
 from tiny_models import (
     write_gguf, tiny_llama, tiny_gemma, tiny_qwen3, tiny_qwen3moe, tiny_qwen2vl,
+    tiny_mamba,
 )
 
 
@@ -103,6 +104,7 @@ class TestOnnxExportPipeline(unittest.TestCase):
     def test_qwen3(self):    self._run_pipeline(tiny_qwen3)
     def test_qwen3moe(self): self._run_pipeline(tiny_qwen3moe)
     def test_qwen2vl(self):  self._run_pipeline(tiny_qwen2vl)
+    def test_mamba(self):    self._run_pipeline(tiny_mamba)
 
     def test_llama_quantised_q4_0(self):
         """Round-trip a quantised GGUF through dequantise + fp16 ONNX.

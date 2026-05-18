@@ -1,0 +1,49 @@
+Top 30 initializers by bytes:
+| name | shape | onnx_dtype | ggml_dtype | n_bytes_onnx |
+|------|-------|------------|------------|-------------:|
+| token_embd.weight_0 | 151936x896 | FLOAT | Q8_0 | 544538624 |
+| token_embd.weight_284 | 151936x896 | FLOAT | Q8_0 | 544538624 |
+| token_embd.weight_T_4436 | 896x151936 | FLOAT | Q8_0 | 544538624 |
+| blk.0.ffn_down.weight_9 | 896x4864 | FLOAT | Q6_K | 17432576 |
+| blk.0.ffn_gate.weight_10 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.0.ffn_up.weight_13 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.1.ffn_down.weight_21 | 896x4864 | FLOAT | Q6_K | 17432576 |
+| blk.1.ffn_gate.weight_22 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.1.ffn_up.weight_25 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.2.ffn_down.weight_33 | 896x4864 | FLOAT | Q4_K | 17432576 |
+| blk.2.ffn_gate.weight_34 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.2.ffn_up.weight_37 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.3.ffn_down.weight_45 | 896x4864 | FLOAT | Q6_K | 17432576 |
+| blk.3.ffn_gate.weight_46 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.3.ffn_up.weight_49 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.4.ffn_down.weight_57 | 896x4864 | FLOAT | Q4_K | 17432576 |
+| blk.4.ffn_gate.weight_58 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.4.ffn_up.weight_61 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.5.ffn_down.weight_69 | 896x4864 | FLOAT | Q4_K | 17432576 |
+| blk.5.ffn_gate.weight_70 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.5.ffn_up.weight_73 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.6.ffn_down.weight_81 | 896x4864 | FLOAT | Q6_K | 17432576 |
+| blk.6.ffn_gate.weight_82 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.6.ffn_up.weight_85 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.7.ffn_down.weight_93 | 896x4864 | FLOAT | Q6_K | 17432576 |
+| blk.7.ffn_gate.weight_94 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.7.ffn_up.weight_97 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.8.ffn_down.weight_105 | 896x4864 | FLOAT | Q6_K | 17432576 |
+| blk.8.ffn_gate.weight_106 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+| blk.8.ffn_up.weight_109 | 4864x896 | FLOAT | Q5_0 | 17432576 |
+
+Model metadata_props:
+  llama_onnx.architecture = qwen2
+  llama_onnx.n_seqs = 1
+  llama_onnx.n_tokens = 32
+  llama_onnx.original_dtype_counts = F32:121,Q4_K:24,Q5_0:264,Q6_K:24,Q8_0:27
+  llama_onnx.weight_dtype = float32
+
+Histogram (observed vs recorded):
+               F32:   121 (observed) vs   121 (recorded)
+              Q4_K:    24 (observed) vs    24 (recorded)
+              Q5_0:   264 (observed) vs   264 (recorded)
+              Q6_K:    24 (observed) vs    24 (recorded)
+              Q8_0:    27 (observed) vs    27 (recorded)
+
+Totals: 460 annotated weight initializers, 1493 total initializers, 4,496,514,560 bytes (annotated, in-ONNX dtype).

@@ -40,13 +40,20 @@ def write_gguf(path: Path, m: TinyModel, *, dtype=np.float32) -> None:
     w.add_block_count(h["n_layer"])
     w.add_embedding_length(h["n_embd"])
     w.add_feed_forward_length(h["n_ff"])
-    w.add_head_count(h["n_head"])
-    w.add_head_count_kv(h["n_head_kv"])
-    w.add_key_length(h["head_dim"])
-    w.add_value_length(h["head_dim"])
+    # Some recurrent / SSM architectures (Mamba, RWKV-7) don't carry attention
+    # heads or rope; for those we let the fixture omit those keys.
+    if "n_head" in h:
+        w.add_head_count(h["n_head"])
+    if "n_head_kv" in h:
+        w.add_head_count_kv(h["n_head_kv"])
+    if "head_dim" in h:
+        w.add_key_length(h["head_dim"])
+        w.add_value_length(h["head_dim"])
     w.add_layer_norm_rms_eps(h["rms_eps"])
-    w.add_rope_dimension_count(h.get("n_rot", h["head_dim"]))
-    w.add_rope_freq_base(h.get("rope_base", 10000.0))
+    if "head_dim" in h:
+        w.add_rope_dimension_count(h.get("n_rot", h["head_dim"]))
+    if "rope_base" in h:
+        w.add_rope_freq_base(h["rope_base"])
     w.add_vocab_size(h["vocab_size"])
     w.add_context_length(h.get("context_length", 64))
     if "n_expert" in h:
@@ -129,6 +136,52 @@ def tiny_qwen3moe(seed=45, *, dtype=np.float32) -> TinyModel:
              n_expert=4, n_expert_used=2)
     return TinyModel(arch="qwen3moe", hparams=h,
                      weights=_llama_like_weights(rng, h, dtype, with_qk_norm=True, with_moe=True))
+
+
+def tiny_mamba(seed=47, *, dtype=np.float32) -> TinyModel:
+    """Mamba-1 fixture: exercises SSM_CONV and SSM_SCAN (Mamba-1, A is (d_state, d_inner)).
+
+    The expansion factor is fixed at 2 (d_inner = 2 * n_embd), matching the
+    assertion in ``llama_model_mamba::load_arch_tensors``.
+    """
+    rng = np.random.default_rng(seed)
+    n_embd = 8
+    d_inner = 2 * n_embd
+    d_state = 4
+    d_conv = 4
+    dt_rank = 2
+    n_layer = 1
+    vocab_size = 32
+    h = dict(
+        n_layer=n_layer, n_embd=n_embd, n_ff=0, vocab_size=vocab_size,
+        rms_eps=1e-5,
+        # SSM-specific:
+        ssm_d_conv=d_conv, ssm_d_inner=d_inner, ssm_d_state=d_state,
+        ssm_dt_rank=dt_rank,
+    )
+    weights = {
+        "token_embd.weight":   _rand(rng, (vocab_size, n_embd), dtype),
+        "output_norm.weight":  np.ones((n_embd,), dtype=dtype),
+    }
+    for il in range(n_layer):
+        weights[f"blk.{il}.attn_norm.weight"]      = np.ones((n_embd,), dtype=dtype)
+        weights[f"blk.{il}.ssm_in.weight"]         = _rand(rng, (2 * d_inner, n_embd), dtype)
+        weights[f"blk.{il}.ssm_conv1d.weight"]     = _rand(rng, (d_inner, d_conv), dtype)
+        weights[f"blk.{il}.ssm_conv1d.bias"]       = _rand(rng, (d_inner,), dtype)
+        weights[f"blk.{il}.ssm_x.weight"]          = _rand(rng, (dt_rank + 2 * d_state, d_inner), dtype)
+        weights[f"blk.{il}.ssm_dt.weight"]         = _rand(rng, (d_inner, dt_rank), dtype)
+        weights[f"blk.{il}.ssm_dt.bias"]           = _rand(rng, (d_inner,), dtype)
+        # ssm_a / ssm_d have no "weight" suffix in mamba (see mamba.cpp).
+        weights[f"blk.{il}.ssm_a"]                 = -_rand(rng, (d_inner, d_state), dtype, scale=0.5)
+        weights[f"blk.{il}.ssm_d"]                 = _rand(rng, (d_inner,), dtype)
+        weights[f"blk.{il}.ssm_out.weight"]        = _rand(rng, (n_embd, d_inner), dtype)
+    extra_kv = [
+        ("add_ssm_conv_kernel",     [d_conv]),
+        ("add_ssm_inner_size",      [d_inner]),
+        ("add_ssm_state_size",      [d_state]),
+        ("add_ssm_time_step_rank",  [dt_rank]),
+    ]
+    return TinyModel(arch="mamba", hparams=h, weights=weights, extra_kv=extra_kv)
 
 
 def tiny_qwen2vl(seed=46, *, dtype=np.float32) -> TinyModel:

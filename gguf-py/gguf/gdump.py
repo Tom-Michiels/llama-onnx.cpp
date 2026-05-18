@@ -194,10 +194,6 @@ _GGML_TO_NUMPY = {
 }
 
 
-def ggml_dtype_to_numpy(t: int) -> np.dtype | None:
-    return _GGML_TO_NUMPY.get(GgmlType(t)) if t in {x.value for x in _GGML_TO_NUMPY} else None
-
-
 @dataclass
 class Tensor:
     name: str
@@ -243,16 +239,22 @@ class Tensor:
                 return r
         return 1
 
-    @property
-    def shape(self) -> list[int]:
-        return list(self.ne[: self.ndim])
-
     def op_params_i32(self, n: int) -> list[int]:
-        """Return the first ``n`` int32 values of op_params."""
+        """Return the first ``n`` int32 values of op_params.
+
+        Note: the signature differs from ``op_params_f32`` for historical
+        reasons -- i32 params are always read from offset 0, while f32 params
+        may live anywhere in the parameter buffer. Don't add an offset here
+        without updating the ~30 call sites; the asymmetry is intentional.
+        """
         return list(struct.unpack_from(f"<{n}i", self.op_params, 0))
 
     def op_params_f32(self, off: int, n: int = 1) -> list[float]:
-        """Return ``n`` float32 values starting at byte offset ``off``."""
+        """Return ``n`` float32 values starting at byte offset ``off``.
+
+        Note: takes a byte offset (unlike ``op_params_i32`` which always reads
+        from 0) because f32 params commonly sit after a leading i32 block.
+        """
         return list(struct.unpack_from(f"<{n}f", self.op_params, off))
 
 

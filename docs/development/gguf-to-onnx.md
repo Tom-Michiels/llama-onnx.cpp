@@ -158,7 +158,7 @@ Implemented today:
 ADD, SUB, MUL, DIV, SCALE, SQR, SQRT, SIN, COS, LOG, CLAMP, REPEAT
 MUL_MAT, MUL_MAT_ID, SCALE
 GET_ROWS (Gather + GatherElements), SET_ROWS (ScatterND)
-RMS_NORM, NORM (LayerNorm without affine)
+RMS_NORM, NORM (LayerNorm without affine), L2_NORM, GROUP_NORM
 RESHAPE, VIEW (contiguous slice + squeeze patterns), CONT, PERMUTE,
 TRANSPOSE, CPY (dtype cast), CONCAT
 GLU (SWIGLU / GEGLU / GEGLU_ERF / REGLU)
@@ -168,13 +168,18 @@ UNARY (SILU, RELU, SIGMOID, TANH, NEG, EXP, GELU, GELU_ERF, HARDSWISH, HARDSIGMO
 ARGSORT, TOP_K (via TopK; indices cast to int32)
 SUM, SUM_ROWS, MEAN (ReduceSum / ReduceMean along last axis)
 FLASH_ATTN_EXT (no softcap, no ALiBi)
+LEAKY_RELU, PAD (constant only), POOL_1D, POOL_2D (max + avg)
+UPSCALE / interpolate (nearest, bilinear, bicubic; antialias for bilinear)
+CONV_2D, CONV_2D_DW (depthwise, group = Cin)
+IM2COL (1D and 2D; expands via Gather + Concat)
 ```
 
 Not yet implemented (will raise `NotImplementedError`):
 
 ```
-GROUP_NORM, ROPE with YaRN scaling, DIAG_MASK_INF, ADD_ID, FILL,
-SSM_*, FLASH_ATTN_BACK, ROPE_TYPE_VISION / IMROPE, CONV_*, POOL_*,
+ROPE with YaRN scaling, DIAG_MASK_INF, FILL,
+SSM_*, FLASH_ATTN_BACK, ROPE_TYPE_VISION / IMROPE,
+CONV_TRANSPOSE_*, CONV_3D, IM2COL_3D, PAD_REFLECT_1D, PAD with circular wrap,
 strided VIEW patterns beyond contiguous-slice and slot-squeeze.
 ```
 
