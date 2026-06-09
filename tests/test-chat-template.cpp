@@ -333,6 +333,16 @@ static common_chat_msg simple_msg(const std::string & role, const std::string & 
     return msg;
 }
 
+static common_chat_msg content_parts_msg(const std::string & role, const std::vector<std::pair<std::string, std::string>> & parts) {
+    common_chat_msg msg;
+    msg.role = role;
+    msg.content_parts.reserve(parts.size());
+    for (const auto & part : parts) {
+        msg.content_parts.push_back({ part.first, part.second });
+    }
+    return msg;
+}
+
 int main_automated_tests(void) {
     // jinja::enable_debug(true);
 
@@ -691,6 +701,77 @@ int main_automated_tests(void) {
                                 test_case.eos_token,
                                 msgs);
             auto expected_output = normalize_newlines(test_case.expected_output_jinja.empty() ? test_case.expected_output : test_case.expected_output_jinja);
+            if (output != expected_output) {
+                std::cout << "Template:```\n" << test_case.template_str << "\n```";
+                std::cout << "-------------------------\n";
+                std::cout << "Expected:```\n" << expected_output << "\n```";
+                std::cout << "-------------------------\n";
+                std::cout << "Actual:```\n" << output << "\n```";
+                std::cout.flush();
+                assert(output == expected_output);
+            }
+        } catch (const std::exception & e) {
+            std::cerr << "ERROR: " << e.what() << "\n";
+            assert(false);
+        }
+    }
+
+    struct VlmTestCase {
+        std::string name;
+        std::string template_str;
+        std::string expected_output;
+        std::string bos_token = "";
+        std::string eos_token = "";
+    };
+
+    std::vector<common_chat_msg> vlm_messages = {
+        content_parts_msg("user", {
+            { "text",         "Describe " },
+            { "media_marker", "<__media__>" },
+            { "text",         " please." },
+        }),
+    };
+
+    const std::vector<VlmTestCase> vlm_test_cases {
+        {
+            /* .name= */ "Qwen2-VL media marker",
+            /* .template_str= */ "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}<|vision_start|><|image_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}{% endif %}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+            /* .expected_output= */ "<|im_start|>user\nDescribe <__media__> please.<|im_end|>\n<|im_start|>assistant\n",
+        },
+        {
+            /* .name= */ "SmolVLM media marker",
+            /* .template_str= */ "<|im_start|>{% for message in messages %}{{message['role'] | capitalize}}{% if message['content'][0]['type'] == 'image' %}{{':'}}{% else %}{{': '}}{% endif %}{% for line in message['content'] %}{% if line['type'] == 'text' %}{{line['text']}}{% elif line['type'] == 'image' %}{{ ' ' }}{% endif %}{% endfor %} \n{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}",
+            /* .expected_output= */ "<|im_start|>User: Describe <__media__> please. \nAssistant:",
+        },
+        {
+            /* .name= */ "Pixtral media marker",
+            /* .template_str= */ "{{ bos_token }}{%- for message in messages %}{%- if message['role'] == 'user' %}{{ '[INST]' }}{%- endif %}{%- if message['content'] is not string %}{%- for chunk in message['content'] %}{%- if chunk['type'] == 'text' %}{{ chunk['text'] }}{%- elif chunk['type'] == 'image' %}{{ '[IMG]' }}{%- endif %}{%- endfor %}{%- else %}{{ message['content'] }}{%- endif %}{%- if message['role'] == 'user' %}{{ '[/INST]' }}{%- elif message['role'] == 'assistant' %}{{ eos_token }}{%- endif %}{%- endfor %}",
+            /* .expected_output= */ "<s>[INST]Describe <__media__> please.[/INST]",
+            /* .bos_token= */ "<s>",
+            /* .eos_token= */ "</s>",
+        },
+        {
+            /* .name= */ "LLaVA media marker",
+            /* .template_str= */ "{% for message in messages %}{% if message['role'] != 'system' %}{{ message['role'].upper() + ': '}}{% endif %}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ ' \n' }}{% endfor %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ content['text'] + ' '}}{% endfor %}{% endfor %}{% if add_generation_prompt %}{{ 'ASSISTANT:' }}{% endif %}",
+            /* .expected_output= */ "USER: Describe  <__media__>  please. ASSISTANT:",
+        },
+        {
+            /* .name= */ "Gemma 3 media marker",
+            /* .template_str= */ "{{ bos_token }}{%- for message in messages -%}{%- if message['role'] == 'assistant' -%}{%- set role = 'model' -%}{%- else -%}{%- set role = message['role'] -%}{%- endif -%}{{ ' ' + role + '\n' }}{%- if message['content'] is string -%}{{ message['content'] | trim }}{%- elif message['content'] is iterable -%}{%- for item in message['content'] -%}{%- if item['type'] == 'image' -%}{{ ' ' }}{%- elif item['type'] == 'text' -%}{{ item['text'] | trim }}{%- endif -%}{%- endfor -%}{%- endif -%}{{ '<end_of_turn>\n' }}{%- endfor -%}{%- if add_generation_prompt -%}{{ ' model\n' }}{%- endif -%}",
+            /* .expected_output= */ "<bos> user\nDescribe <__media__> please.<end_of_turn>\n model\n",
+            /* .bos_token= */ "<bos>",
+        },
+    };
+
+    for (const auto & test_case : vlm_test_cases) {
+        std::cout << "\n\n=== " << test_case.name << " (jinja) ===\n\n";
+        try {
+            auto output = format_using_common(
+                                test_case.template_str,
+                                test_case.bos_token,
+                                test_case.eos_token,
+                                vlm_messages);
+            auto expected_output = normalize_newlines(test_case.expected_output);
             if (output != expected_output) {
                 std::cout << "Template:```\n" << test_case.template_str << "\n```";
                 std::cout << "-------------------------\n";

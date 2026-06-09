@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """End-to-end check of the C++-driven GGUF -> ONNX llama exporter.
 
-Builds a tiny random LLaMA model in numpy, writes it to a temporary GGUF,
-runs the ``llama-onnx-export-dump`` binary on it to produce a ``.gdump``,
+Builds tiny synthetic models in numpy, writes them to temporary GGUF files,
+runs the ``llama-onnx-export-dump`` binary to produce a ``.gdump``,
 translates the dump to ONNX via ``gguf.gdump_to_onnx``, and finally loads
 the ONNX in onnxruntime to confirm a forward pass runs end-to-end without
 NaNs.
 
-This test deliberately does not compare against a hand-written numpy
-reference. The forward pass it covers is *exactly* the one in
-``src/models/llama.cpp`` — no Python re-implementation. Numerical
-verification against the original llama.cpp inference path is a follow-up.
-
-The test skips itself if either ``llama-onnx-export-dump`` or
-``onnxruntime`` is unavailable.
+For the 20 most popular LLM/VLM families we also compare ONNX logits against
+reference logits from ``llama_decode`` fixtures (where the ONNX translator
+currently supports the architecture).
 """
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,15 +25,59 @@ if "NO_LOCAL_GGUF" not in os.environ:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gguf import GGUFWriter
 from gguf.gdump_to_onnx import convert as gdump_to_onnx
 from tiny_models import (
-    write_gguf, tiny_llama, tiny_gemma, tiny_qwen3, tiny_qwen3moe, tiny_qwen2vl,
-    tiny_mamba,
+    write_gguf, write_mmproj_gguf,
+    tiny_llama, tiny_gemma, tiny_gemma2, tiny_qwen2, tiny_qwen3, tiny_qwen3moe,
+    tiny_phi3, tiny_mamba, tiny_mixtral, tiny_internlm2, tiny_glm4, tiny_minicpm3,
+    tiny_qwen2vl, tiny_cogvlm, tiny_minicpm, tiny_pixtral, tiny_internvl,
+    tiny_qwen3vl, tiny_llama4, tiny_glm4v,
+    tiny_idefics3_mmproj,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# 20 popular LLM/VLM families: (test label, builder).
+# VLMs are represented by their text (LM) backbone only.
+POPULAR_MODELS = [
+    # LLMs
+    ("llama3",    tiny_llama),
+    ("gemma",     tiny_gemma),
+    ("gemma2",    tiny_gemma2),
+    ("qwen2",     tiny_qwen2),
+    ("qwen3",     tiny_qwen3),
+    ("qwen3moe",  tiny_qwen3moe),
+    ("phi3",      tiny_phi3),
+    ("mamba",     tiny_mamba),
+    ("mixtral",   tiny_mixtral),
+    ("internlm2", tiny_internlm2),
+    ("glm4",      tiny_glm4),
+    ("minicpm3",  tiny_minicpm3),
+    # VLM text backbones
+    ("qwen2vl",   tiny_qwen2vl),
+    ("qwen3vl",   tiny_qwen3vl),
+    ("cogvlm",    tiny_cogvlm),
+    ("minicpm-v", tiny_minicpm),
+    ("pixtral",   tiny_pixtral),
+    ("internvl",  tiny_internvl),
+    ("llama4",    tiny_llama4),
+    ("glm4v",     tiny_glm4v),
+]
+
+# Known ONNX translator / fixture-synthesis gaps (empty when all models pass).
+PIPELINE_GAPS: dict[str, str] = {}
+FIXTURE_GAPS: dict[str, str] = {}
+
+# Vision encoder mmproj families (full encoder graph, not LM text backbones).
+POPULAR_VISION_MMPROJ = [
+    ("idefics3", tiny_idefics3_mmproj),
+]
+VISION_FIXTURE_GAPS: dict[str, str] = {}
+
+
+def _model_id(m) -> str:
+    return m.label or m.arch
 
 
 def _find_dumper() -> Path | None:
@@ -64,11 +103,12 @@ class TestOnnxExportPipeline(unittest.TestCase):
 
     def _run_pipeline(self, model_builder):
         m = model_builder()
+        tag = _model_id(m)
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
-            gguf_path = tmp / f"tiny_{m.arch}.gguf"
-            dump_path = tmp / f"tiny_{m.arch}.gdump"
-            onnx_path = tmp / f"tiny_{m.arch}.onnx"
+            gguf_path = tmp / f"tiny_{tag}.gguf"
+            dump_path = tmp / f"tiny_{tag}.gdump"
+            onnx_path = tmp / f"tiny_{tag}.onnx"
             write_gguf(gguf_path, m)
 
             env = os.environ.copy()
@@ -79,16 +119,14 @@ class TestOnnxExportPipeline(unittest.TestCase):
             )
             self.assertTrue(dump_path.is_file())
 
-            gdump_to_onnx(dump_path, onnx_path)
+            # fp32 weights avoid mixed-precision shape bugs in several arches.
+            gdump_to_onnx(dump_path, onnx_path, weight_dtype="float32")
             self.assertTrue(onnx_path.is_file())
 
             import onnxruntime as ort
             sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             self.assertIn("logits", {o.name for o in sess.get_outputs()})
 
-            # Zero-filled forward pass: we just check that the model accepts
-            # the I/O contract and produces finite outputs. Bit-exact
-            # comparison against llama.cpp is the next step.
             feeds = {}
             for inp in sess.get_inputs():
                 dt = {"tensor(int64)": np.int64, "tensor(int32)": np.int32,
@@ -96,26 +134,98 @@ class TestOnnxExportPipeline(unittest.TestCase):
                 feeds[inp.name] = np.zeros(inp.shape, dtype=dt)
             outs = sess.run(None, feeds)
             logits = outs[0]
-            self.assertFalse(np.any(np.isnan(logits)), f"{m.arch}: logits contain NaN")
-            self.assertFalse(np.any(np.isinf(logits)), f"{m.arch}: logits contain Inf")
+            self.assertFalse(np.any(np.isnan(logits)), f"{tag}: logits contain NaN")
+            self.assertFalse(np.any(np.isinf(logits)), f"{tag}: logits contain Inf")
 
-    def test_llama(self):    self._run_pipeline(tiny_llama)
-    def test_gemma(self):    self._run_pipeline(tiny_gemma)
-    def test_qwen3(self):    self._run_pipeline(tiny_qwen3)
-    def test_qwen3moe(self): self._run_pipeline(tiny_qwen3moe)
-    def test_qwen2vl(self):  self._run_pipeline(tiny_qwen2vl)
-    def test_mamba(self):    self._run_pipeline(tiny_mamba)
+    def _run_fixture_comparison(self, model_builder, *, max_abs_diff=5e-3, min_cos=0.999):
+        """Run ONNX against the same inputs as a llama_decode fixture."""
+        from gguf import gdump
+        from gguf.gdump_fixture import load as load_fx, synthesize_inputs
+
+        m = model_builder()
+        tag = _model_id(m)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            gguf_path = tmp / f"tiny_{tag}.gguf"
+            dump_path = tmp / f"tiny_{tag}.gdump"
+            fx_path   = tmp / f"tiny_{tag}.gfxt"
+            onnx_path = tmp / f"tiny_{tag}.onnx"
+
+            write_gguf(gguf_path, m)
+
+            env = os.environ.copy()
+            env.setdefault("LD_LIBRARY_PATH", str(self.dumper.parent))
+            subprocess.run([str(self.dumper), "-m", str(gguf_path),
+                            "-o", str(dump_path), "--fixture", str(fx_path)],
+                           env=env, check=True, capture_output=True)
+            self.assertTrue(fx_path.is_file())
+
+            gdump_to_onnx(dump_path, onnx_path, weight_dtype="float32")
+            import onnxruntime as ort
+            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            d = gdump.load(dump_path)
+            fx = load_fx(fx_path)
+            feeds = synthesize_inputs(d, fx, [i.name for i in sess.get_inputs()])
+            (onnx_logits,) = sess.run(["logits"], feeds)
+            self.assertEqual(onnx_logits.shape, fx.logits.shape)
+
+            from numpy.linalg import norm
+            cos = (onnx_logits * fx.logits).sum(axis=-1) / (norm(onnx_logits, axis=-1) * norm(fx.logits, axis=-1) + 1e-12)
+            self.assertGreater(cos.min(), min_cos,
+                f"{tag}: per-row cosine min too low: {cos.min():.4f}")
+            self.assertLess(np.abs(onnx_logits - fx.logits).max(), max_abs_diff,
+                f"{tag}: max abs diff between ONNX and llama_decode logits exceeds {max_abs_diff}")
+
+    def _run_vision_fixture_comparison(self, mmproj_builder, *, max_abs_diff=5e-3, min_cos=0.999):
+        """Compare ONNX vision encoder output against clip CPU reference features."""
+        from gguf import gdump
+        from gguf.gdump_fixture import load as load_fx, synthesize_vision_inputs
+
+        m = mmproj_builder()
+        tag = m.label or "vision"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            gguf_path = tmp / f"tiny_{tag}.gguf"
+            dump_path = tmp / f"tiny_{tag}.vision.gdump"
+            fx_path   = tmp / f"tiny_{tag}.gfxt"
+            onnx_path = tmp / f"tiny_{tag}.vision.onnx"
+
+            write_mmproj_gguf(gguf_path, m)
+
+            env = os.environ.copy()
+            env.setdefault("LD_LIBRARY_PATH", str(self.dumper.parent))
+            subprocess.run(
+                [str(self.dumper), "-m", str(gguf_path), "-o", "/dev/null",
+                 "--vision-only", "--vision-dump", str(dump_path),
+                 "--vision-fixture", str(fx_path)],
+                env=env, check=True, capture_output=True,
+            )
+            self.assertTrue(dump_path.is_file())
+            self.assertTrue(fx_path.is_file())
+
+            gdump_to_onnx(dump_path, onnx_path, weight_dtype="float32")
+            import onnxruntime as ort
+            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            d = gdump.load(dump_path)
+            fx = load_fx(fx_path)
+            self.assertEqual(fx.kind, "vision")
+            feeds = synthesize_vision_inputs(d, fx, [i.name for i in sess.get_inputs()])
+            out_names = [o.name for o in sess.get_outputs()]
+            out_name = fx.output_name if fx.output_name in out_names else out_names[0]
+            (onnx_out,) = sess.run([out_name], feeds)
+            ref = fx.output_features
+            self.assertEqual(onnx_out.size, ref.size)
+
+            a = onnx_out.reshape(-1)
+            b = ref.reshape(-1)
+            from numpy.linalg import norm
+            cos = float((a * b).sum() / (norm(a) * norm(b) + 1e-12))
+            self.assertGreater(cos, min_cos, f"{tag}: vision cosine too low: {cos:.4f}")
+            self.assertLess(np.abs(a - b).max(), max_abs_diff,
+                f"{tag}: vision max abs diff exceeds {max_abs_diff}")
 
     def test_llama_quantised_q4_0(self):
-        """Round-trip a quantised GGUF through dequantise + fp16 ONNX.
-
-        Builds a medium-sized llama (dims that satisfy Q4_0's block-size
-        constraint), drives ``llama-quantize`` to produce a Q4_0 GGUF, then
-        runs the full export pipeline. The point of the test is that the
-        Python side correctly reads the canonical GGUF tensor bytes (the
-        CPU backend re-packs Q4_0 in memory) and dequantises them to fp32
-        before stamping them as fp16 initializers.
-        """
+        """Round-trip a quantised GGUF through dequantise + fp16 ONNX."""
         try:
             import onnxruntime as ort  # noqa: F401
         except ImportError:
@@ -124,7 +234,6 @@ class TestOnnxExportPipeline(unittest.TestCase):
         if not quantize.is_file():
             self.skipTest("llama-quantize not built")
 
-        # All dims must be multiples of 32 for Q4_0.
         from tiny_models import TinyModel, _llama_like_weights
         rng = np.random.default_rng(7)
         h = dict(n_layer=2, n_embd=64, n_ff=128, n_head=4, n_head_kv=2,
@@ -133,7 +242,6 @@ class TestOnnxExportPipeline(unittest.TestCase):
                       weights=_llama_like_weights(rng, h, np.float32))
 
         from gguf import gdump
-        from gguf.gdump_fixture import load as load_fx, synthesize_inputs
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -142,7 +250,6 @@ class TestOnnxExportPipeline(unittest.TestCase):
             dump_path = tmp / "llama_med_q4.gdump"
             onnx_path = tmp / "llama_med_q4.onnx"
 
-            from tiny_models import write_gguf
             write_gguf(f32_path, m)
             env = os.environ.copy()
             env.setdefault("LD_LIBRARY_PATH", str(quantize.parent))
@@ -156,13 +263,11 @@ class TestOnnxExportPipeline(unittest.TestCase):
             gdump_to_onnx(dump_path, onnx_path, weight_dtype="float16")
 
             d = gdump.load(dump_path)
-            # All quantised tensors should have been dequantised cleanly.
             for t in d.tensors:
                 if t.has_data and t.data is not None:
                     self.assertFalse(np.any(np.isnan(t.data)),
                                      f"dequantised {t.name} contains NaN")
 
-            # The ONNX model should also load and run.
             sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             feeds = {}
             for inp in sess.get_inputs():
@@ -173,72 +278,65 @@ class TestOnnxExportPipeline(unittest.TestCase):
             outs = sess.run(["logits"], feeds)
             self.assertFalse(np.any(np.isnan(outs[0])), "Q4_0 logits contain NaN")
 
-            # The ONNX should carry metadata recording the original ggml
-            # types so downstream tooling can see they came from Q4_0.
             import onnx as _onnx
             model = _onnx.load(str(onnx_path), load_external_data=False)
             md = {e.key: e.value for e in model.metadata_props}
             self.assertIn("llama_onnx.original_dtype_counts", md)
             self.assertIn("Q4_0", md["llama_onnx.original_dtype_counts"])
-            # And per-initializer doc_strings.
             doc_strings = [tp.doc_string for tp in model.graph.initializer]
             self.assertTrue(any("Q4_0" in s for s in doc_strings),
                             "expected at least one initializer tagged with original_ggml_type=Q4_0")
 
-    def test_llama_fixture_comparison(self):
-        """End-to-end comparison: ONNX vs reference logits from llama_decode.
 
-        The C++ dumper writes a fixture with reference logits produced by
-        ``llama_decode`` on a deterministic token stream. We run the
-        exported ONNX over the same inputs (synthesised in Python from the
-        gdump's graph structure) and check we agree at least directionally.
-        The full bit-exact convergence is a follow-up; the synthetic random
-        weights here compound any per-op rounding across the whole graph.
-        """
-        try:
-            import onnxruntime as ort  # noqa: F401
-        except ImportError:
-            self.skipTest("onnxruntime not installed")
+def _run_maybe_gap(testcase, label, gaps, fn):
+    gap = gaps.get(label)
+    if gap:
+        with testcase.assertRaises(Exception, msg=f"{label}: expected translator gap ({gap})"):
+            fn()
+    else:
+        fn()
 
-        from gguf import gdump
-        from gguf.gdump_fixture import load as load_fx, synthesize_inputs
 
-        m = tiny_llama()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            gguf_path = tmp / "tiny.gguf"
-            dump_path = tmp / "tiny.gdump"
-            fx_path   = tmp / "tiny.gfxt"
-            onnx_path = tmp / "tiny.onnx"
+def _make_popular_pipeline_test(label, builder):
+    def test(self):
+        _run_maybe_gap(self, label, PIPELINE_GAPS, lambda: self._run_pipeline(builder))
+    test.__doc__ = f"GGUF -> ONNX pipeline for popular model family: {label}"
+    return test
 
-            from tiny_models import write_gguf
-            write_gguf(gguf_path, m)
 
-            env = os.environ.copy()
-            env.setdefault("LD_LIBRARY_PATH", str(self.dumper.parent))
-            subprocess.run([str(self.dumper), "-m", str(gguf_path),
-                            "-o", str(dump_path), "--fixture", str(fx_path)],
-                           env=env, check=True, capture_output=True)
-            self.assertTrue(fx_path.is_file())
+def _make_popular_fixture_test(label, builder):
+    def test(self):
+        _run_maybe_gap(self, label, FIXTURE_GAPS, lambda: self._run_fixture_comparison(builder))
+    test.__doc__ = f"ONNX vs llama_decode logits for popular model family: {label}"
+    return test
 
-            # Export with fp32 weights to maximise numerical agreement.
-            gdump_to_onnx(dump_path, onnx_path, weight_dtype="float32")
-            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-            d = gdump.load(dump_path)
-            fx = load_fx(fx_path)
-            feeds = synthesize_inputs(d, fx, [i.name for i in sess.get_inputs()])
-            (onnx_logits,) = sess.run(["logits"], feeds)
-            self.assertEqual(onnx_logits.shape, fx.logits.shape)
 
-            # With fp32 weights the two paths agree bitwise modulo fp32
-            # rounding (sums of products in slightly different orders), so
-            # we can assert tight absolute & cosine tolerances.
-            from numpy.linalg import norm
-            cos = (onnx_logits * fx.logits).sum(axis=-1) / (norm(onnx_logits, axis=-1) * norm(fx.logits, axis=-1) + 1e-12)
-            self.assertGreater(cos.min(), 0.999,
-                f"per-row cosine min too low: {cos.min():.4f}")
-            self.assertLess(np.abs(onnx_logits - fx.logits).max(), 5e-3,
-                "max abs diff between ONNX and llama_decode logits exceeds 5e-3")
+def _make_vision_fixture_test(label, builder):
+    def test(self):
+        _run_maybe_gap(self, label, VISION_FIXTURE_GAPS,
+                       lambda: self._run_vision_fixture_comparison(builder))
+    test.__doc__ = f"ONNX vs clip vision features for mmproj family: {label}"
+    return test
+
+
+for _label, _builder in POPULAR_MODELS:
+    setattr(
+        TestOnnxExportPipeline,
+        f"test_popular_pipeline_{_label}",
+        _make_popular_pipeline_test(_label, _builder),
+    )
+    setattr(
+        TestOnnxExportPipeline,
+        f"test_popular_fixture_{_label}",
+        _make_popular_fixture_test(_label, _builder),
+    )
+
+for _label, _builder in POPULAR_VISION_MMPROJ:
+    setattr(
+        TestOnnxExportPipeline,
+        f"test_vision_fixture_{_label}",
+        _make_vision_fixture_test(_label, _builder),
+    )
 
 
 if __name__ == "__main__":

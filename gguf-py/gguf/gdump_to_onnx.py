@@ -566,9 +566,16 @@ def _h_get_rows(tr: Translator, t: gdump.Tensor) -> None:
             f"GET_ROWS shape mismatch after squeeze: data {data_logical}, idx {idx_logical}"
         )
     axis = len(data_logical) - 1
-    tr.value[t.index] = tr._emit(
+    gathered = tr._emit(
         "GatherElements", [data, idx_i64], t.name or "gather_elements", axis=axis,
     )
+    target = _ggml_shape_to_logical(t.ne)
+    if target != data_logical[:-1] + [idx_logical[-1]]:
+        gathered = tr._emit(
+            "Reshape", [gathered, tr._const_i64("get_rows_target", target)],
+            t.name or "gather_elements_reshaped",
+        )
+    tr.value[t.index] = gathered
 
 
 @_op(gdump.GgmlOp.RMS_NORM)
@@ -597,11 +604,33 @@ def _h_reshape(tr: Translator, t: gdump.Tensor) -> None:
     tr.value[t.index] = tr._emit("Reshape", [src, shape_name], t.name or "reshape")
 
 
+def _resolve_view_root(dump: gdump.GraphDump, t: gdump.Tensor) -> tuple[gdump.Tensor, int]:
+    """Follow a chain of VIEW ops to the underlying tensor and sum byte offsets."""
+    total_offset = 0
+    cur = t
+    seen: set[int] = set()
+    while cur.ggml_op == gdump.GgmlOp.VIEW and cur.sources:
+        if cur.index in seen:
+            break
+        seen.add(cur.index)
+        if cur.op_params and len(cur.op_params) >= 8:
+            total_offset += struct.unpack_from("<Q", cur.op_params, 0)[0]
+        cur = dump.tensors[cur.sources[0]]
+    return cur, total_offset
+
+
 @_op(gdump.GgmlOp.VIEW, gdump.GgmlOp.CONT)
 def _h_view(tr: Translator, t: gdump.Tensor) -> None:
     # Both VIEW and CONT change layout / contiguity but not values.
-    src = tr.src(t, 0)
-    src_v = tr.src_value(t, 0)
+    if t.ggml_op == gdump.GgmlOp.VIEW:
+        src, offset = _resolve_view_root(tr.dump, t)
+        src_v = tr.value.get(src.index)
+        if src_v is None:
+            src_v = tr.src_value(t, 0)
+    else:
+        src = tr.src(t, 0)
+        src_v = tr.src_value(t, 0)
+        offset = 0
     target = _ggml_shape_to_logical(t.ne)
     src_logical = _ggml_shape_to_logical(src.ne)
     if target == src_logical:
@@ -631,9 +660,8 @@ def _h_view(tr: Translator, t: gdump.Tensor) -> None:
 
     # Strided view: try to express as a contiguous Slice (optionally followed
     # by a Squeeze) along a single axis. ggml stores the view's byte offset
-    # in op_params[0..7] (size_t).
+    # in op_params[0..7] (size_t); chained views accumulate into ``offset``.
     if t.ggml_op == gdump.GgmlOp.VIEW:
-        offset = struct.unpack_from("<Q", t.op_params, 0)[0]
         if _try_slice_view(tr, t, src, src_v, offset):
             return
         if _try_squeeze_view(tr, t, src, src_v, offset):
@@ -1254,6 +1282,7 @@ def _h_rope_mrope(
     tr: "Translator", t: gdump.Tensor,
     n_dims: int, sections: list[int],
     freq_base: float, freq_scale: float, attn_factor: float,
+    *, interleaved: bool = False,
 ) -> None:
     """qwen2vl-style multimodal RoPE.
 
@@ -1266,8 +1295,9 @@ def _h_rope_mrope(
     head_dim = x_t.ne[0]
     n_head   = x_t.ne[1]
     n_tokens = x_t.ne[2]
-    assert head_dim == n_dims, "partial mrope not supported"
-    half = head_dim // 2
+    n_rope = n_dims
+    n_pass = head_dim - n_rope
+    half = n_rope // 2
     sum_sections = sum(sections)
     assert sum_sections > 0, "mrope sections cannot be all zero"
 
@@ -1278,7 +1308,16 @@ def _h_rope_mrope(
     sec_e = sec_w + sections[2]
     for i in range(half):
         sector = i % sum_sections
-        if sector < sections[0]:
+        if interleaved:
+            if sector % 3 == 1 and sector < 3 * sections[1]:
+                k = 1
+            elif sector % 3 == 2 and sector < 3 * sections[2]:
+                k = 2
+            elif sector % 3 == 0 and sector < 3 * sections[0]:
+                k = 0
+            else:
+                k = 3
+        elif sector < sections[0]:
             k = 0
         elif sector < sec_w:
             k = 1
@@ -1301,7 +1340,7 @@ def _h_rope_mrope(
     # Transpose to [n_tokens, half] for downstream broadcasting.
     pos_per_pair = tr._emit("Transpose", [pos_per_pair], "pos_per_pair_T", perm=[1, 0])
 
-    inv = 1.0 / (freq_base ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+    inv = 1.0 / (freq_base ** (np.arange(0, n_rope, 2, dtype=np.float64) / float(n_rope)))
     inv = inv * float(freq_scale) * float(attn_factor or 1.0)
     inv_const = tr._const("mrope_inv_freqs", inv.astype(np.float32))
     inv_u = tr._emit("Unsqueeze", [inv_const, tr._axes_const([0])], "inv_u")
@@ -1322,8 +1361,20 @@ def _h_rope_mrope(
         tr._emit("Unsqueeze", [sin, tr._axes_const([1])], "mrope_sin_b_f"),
         "mrope_sin_b")
 
-    # NEOX-style halves split.
-    x_resh = tr._emit("Reshape", [x_v, tr._const_i64("mrope_x_shape", [n_tokens, n_head, 2, half])], "mrope_x")
+    # NEOX-style halves split on the rotated prefix only.
+    if n_pass > 0:
+        x_flat = tr._emit("Reshape", [x_v, tr._const_i64("mrope_x_flat", [n_tokens, n_head, head_dim])], "mrope_x_flat")
+        rot_name, pass_name = tr._fresh("mrope_rot"), tr._fresh("mrope_pass")
+        split_sizes = tr._const_i64("mrope_split_sizes", [n_rope, n_pass])
+        tr.nodes.append(helper.make_node(
+            "Split", [x_flat, split_sizes], [rot_name, pass_name], axis=-1,
+        ))
+        x_rot = rot_name
+        x_pass = pass_name
+    else:
+        x_rot = tr._emit("Reshape", [x_v, tr._const_i64("mrope_x_flat", [n_tokens, n_head, head_dim])], "mrope_x_flat")
+        x_pass = None
+    x_resh = tr._emit("Reshape", [x_rot, tr._const_i64("mrope_x_shape", [n_tokens, n_head, 2, half])], "mrope_x")
     x_e_name, x_o_name = tr._fresh("mrope_x_even"), tr._fresh("mrope_x_odd")
     tr.nodes.append(helper.make_node("Split", [x_resh], [x_e_name, x_o_name], axis=-2))
     x_e = tr._emit("Squeeze", [x_e_name, tr._axes_const([-2])], "mrope_x_e")
@@ -1338,7 +1389,11 @@ def _h_rope_mrope(
     no_u = tr._emit("Unsqueeze", [new_o, tr._axes_const([-2])], "mrope_no_u")
     stacked = tr._fresh("mrope_stacked")
     tr.nodes.append(helper.make_node("Concat", [ne_u, no_u], [stacked], axis=-2))
-    out = tr._emit("Reshape", [stacked, tr._const_i64("mrope_out_shape", [n_tokens, n_head, head_dim])], t.name or "mrope_out")
+    rot_out = tr._emit("Reshape", [stacked, tr._const_i64("mrope_rot_shape", [n_tokens, n_head, n_rope])], "mrope_rot_out")
+    if x_pass is not None:
+        out = tr._emit("Concat", [rot_out, x_pass], t.name or "mrope_out", axis=-1)
+    else:
+        out = rot_out
     tr.value[t.index] = out
 
 
@@ -1364,12 +1419,13 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
     NEOX_MODE   = 2
     MROPE_MODE  = 8
     IMROPE_MODE = 40
-    if mode not in (NORMAL_MODE, NEOX_MODE, MROPE_MODE):
+    if mode not in (NORMAL_MODE, NEOX_MODE, MROPE_MODE, IMROPE_MODE):
         raise NotImplementedError(f"RoPE mode {mode} not implemented")
-    if mode == MROPE_MODE:
+    if mode in (MROPE_MODE, IMROPE_MODE):
         if ext_factor != 0.0:
             raise NotImplementedError("YaRN-style MROPE (ext_factor != 0) not implemented")
-        _h_rope_mrope(tr, t, n_dims, sections, freq_base, freq_scale, attn_factor)
+        _h_rope_mrope(tr, t, n_dims, sections, freq_base, freq_scale, attn_factor,
+                      interleaved=(mode == IMROPE_MODE))
         return
 
     x_v = tr.src_value(t, 0)
@@ -1383,8 +1439,9 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
     head_dim = x_t.ne[0]
     n_head   = x_t.ne[1]
     n_tokens = x_t.ne[2]
-    assert head_dim == n_dims, f"partial RoPE not supported (head_dim={head_dim}, n_dims={n_dims})"
-    half = head_dim // 2
+    n_rope = n_dims
+    n_pass = head_dim - n_rope
+    half = n_rope // 2
 
     # inv_freqs as a constant initializer.
     # Pre-YaRN behaviour bakes attn_factor and freq_scale into the angle
@@ -1392,8 +1449,8 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
     # the math is different: angles use freq_scale-mixed extrapolation/interpolation
     # of theta, and attn_factor turns into an *amplitude* scaling on cos/sin.
     # See ggml/src/ggml-cpu/ops.cpp:rope_yarn for the reference impl.
-    i0 = np.arange(0, head_dim, 2, dtype=np.float64)
-    inv_extrap = 1.0 / (freq_base ** (i0 / head_dim))
+    i0 = np.arange(0, n_rope, 2, dtype=np.float64)
+    inv_extrap = 1.0 / (freq_base ** (i0 / float(n_rope)))
     if ext_factor != 0.0:
         # YaRN: mix extrapolation/interpolation theta over a ramp on i0/2.
         def _yarn_corr_dim(rot: float) -> float:
@@ -1444,11 +1501,23 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
         tr._emit("Unsqueeze", [sin, tr._axes_const([1])], "rope_sin_b_f"),
         "rope_sin_b")
 
-    # Reshape x to [n_tokens, n_head, head_dim/2, 2] for NORMAL or
-    # [n_tokens, n_head, 2, head_dim/2] for NEOX.
+    if n_pass > 0:
+        x_flat = tr._emit("Reshape", [x_v, tr._const_i64("rope_x_flat", [n_tokens, n_head, head_dim])], "rope_x_flat")
+        rot_name, pass_name = tr._fresh("rope_rot"), tr._fresh("rope_pass")
+        split_sizes = tr._const_i64("rope_split_sizes", [n_rope, n_pass])
+        tr.nodes.append(helper.make_node(
+            "Split", [x_flat, split_sizes], [rot_name, pass_name], axis=-1,
+        ))
+        x_work = rot_name
+        x_pass = pass_name
+    else:
+        x_work = x_v
+        x_pass = None
+
+    # Reshape x to [n_tokens, n_head, n_rope/2, 2] for NORMAL or
+    # [n_tokens, n_head, 2, n_rope/2] for NEOX.
     if mode == NORMAL_MODE:
-        x_pairs = tr._emit("Reshape", [x_v, tr._const_i64("rope_pairs_shape", [n_tokens, n_head, half, 2])], "x_pairs")
-        # Split into even / odd along last axis.
+        x_pairs = tr._emit("Reshape", [x_work, tr._const_i64("rope_pairs_shape", [n_tokens, n_head, half, 2])], "x_pairs")
         x_e_name, x_o_name = tr._fresh("x_even"), tr._fresh("x_odd")
         tr.nodes.append(helper.make_node("Split", [x_pairs], [x_e_name, x_o_name], axis=-1))
         x_e = tr._emit("Squeeze", [x_e_name, tr._axes_const([-1])], "x_e_sq")
@@ -1459,11 +1528,9 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
         no_u = tr._emit("Unsqueeze", [new_o, tr._axes_const([-1])], "no_u")
         stacked = tr._fresh("rope_stacked")
         tr.nodes.append(helper.make_node("Concat", [ne_u, no_u], [stacked], axis=-1))
-        out = tr._emit("Reshape", [stacked, tr._const_i64("rope_out_shape", [n_tokens, n_head, head_dim])], t.name or "rope")
-        tr.value[t.index] = out
+        rot_out = tr._emit("Reshape", [stacked, tr._const_i64("rope_rot_shape", [n_tokens, n_head, n_rope])], "rope_rot_out")
     else:
-        # NEOX: split halves.
-        x_resh = tr._emit("Reshape", [x_v, tr._const_i64("rope_neox_shape", [n_tokens, n_head, 2, half])], "x_neox")
+        x_resh = tr._emit("Reshape", [x_work, tr._const_i64("rope_neox_shape", [n_tokens, n_head, 2, half])], "x_neox")
         x_e_name, x_o_name = tr._fresh("x_even"), tr._fresh("x_odd")
         tr.nodes.append(helper.make_node("Split", [x_resh], [x_e_name, x_o_name], axis=-2))
         x_e = tr._emit("Squeeze", [x_e_name, tr._axes_const([-2])], "x_e_sq")
@@ -1474,8 +1541,13 @@ def _h_rope(tr: Translator, t: gdump.Tensor) -> None:
         no_u = tr._emit("Unsqueeze", [new_o, tr._axes_const([-2])], "no_u")
         stacked = tr._fresh("rope_stacked")
         tr.nodes.append(helper.make_node("Concat", [ne_u, no_u], [stacked], axis=-2))
-        out = tr._emit("Reshape", [stacked, tr._const_i64("rope_neox_out", [n_tokens, n_head, head_dim])], t.name or "rope_neox")
-        tr.value[t.index] = out
+        rot_out = tr._emit("Reshape", [stacked, tr._const_i64("rope_rot_shape", [n_tokens, n_head, n_rope])], "rope_rot_out")
+
+    if x_pass is not None:
+        out = tr._emit("Concat", [rot_out, x_pass], t.name or "rope_out", axis=-1)
+    else:
+        out = rot_out
+    tr.value[t.index] = out
 
 
 @_op(gdump.GgmlOp.SET_ROWS)
@@ -1506,8 +1578,6 @@ def _h_set_rows(tr: Translator, t: gdump.Tensor) -> None:
 def _h_flash_attn(tr: Translator, t: gdump.Tensor) -> None:
     # op_params: f32[3] = scale, max_bias, logit_softcap.
     scale, max_bias, logit_softcap = t.op_params_f32(0, 3)
-    if logit_softcap != 0.0:
-        raise NotImplementedError("FLASH_ATTN_EXT with logit softcap not implemented")
     if max_bias != 0.0:
         raise NotImplementedError("FLASH_ATTN_EXT with ALiBi (max_bias > 0) not implemented")
 
@@ -1571,8 +1641,14 @@ def _h_flash_attn(tr: Translator, t: gdump.Tensor) -> None:
     perm[-1], perm[-2] = perm[-2], perm[-1]
     kT = tr._emit("Transpose", [k], "kT", perm=perm)
     scores = tr._emit("MatMul", [q, kT], "scores")
+    if logit_softcap != 0.0:
+        scale = scale / logit_softcap
     s_const = tr._const("attn_scale", np.array(scale, dtype=tr._weight_np_dtype))
     scores = tr._emit("Mul", [scores, s_const], "scores_scaled")
+    if logit_softcap != 0.0:
+        cap_const = tr._const("attn_logit_softcap", np.array(logit_softcap, dtype=tr._weight_np_dtype))
+        scores = tr._emit("Tanh", [scores], "scores_tanh")
+        scores = tr._emit("Mul", [scores, cap_const], "scores_softcap")
     if mask is not None:
         mask_cast = tr._emit("Cast", [mask], "mask_cast", to=tr._compute_onnx_dtype)
         scores = tr._emit("Add", [scores, mask_cast], "scores_masked")

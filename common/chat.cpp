@@ -80,7 +80,7 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty()) {
         jmsg["content"] = content;
     } else if (!content_parts.empty()) {
-        if (concat_typed_text || contains_media()) {
+        if (concat_typed_text) {
             std::string text;
             bool last_was_media_marker = false;
             // join parts with newline, do not add newline before or after media markers
@@ -107,8 +107,9 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
         } else {
             auto & parts = jmsg["content"] = json::array();
             for (const auto & part : content_parts) {
+                const std::string type = part.type == "media_marker" ? "text" : part.type;
                 parts.push_back({
-                    {"type", part.type},
+                    {"type", type},
                     {"text", part.text},
                 });
             }

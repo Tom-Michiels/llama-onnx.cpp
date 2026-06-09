@@ -191,6 +191,7 @@ def identify_roles(dump: gdump.GraphDump) -> dict[int, str]:
       "v_idxs"       -- SET_ROWS column indices for the V cache
       "out_ids"      -- GET_ROWS indices into a layer output
       "kq_mask"      -- additive attention mask
+      "attn_scale"   -- Llama4/Mistral3 attention temperature scale (F32)
       "cache_k_<L>"  -- L-th layer K cache (initial zeros)
       "cache_v_<L>"  -- L-th layer V cache (initial zeros)
     """
@@ -234,6 +235,12 @@ def identify_roles(dump: gdump.GraphDump) -> dict[int, str]:
             roles[t.index] = f"cache_k_{t.name[len('cache_k_l'):]}"
         elif _is_cache(t.name, "v"):
             roles[t.index] = f"cache_v_{t.name[len('cache_v_l'):]}"
+        elif t.name.startswith("cache_r_l"):
+            roles[t.index] = f"cache_r_{t.name[len('cache_r_l'):]}"
+        elif t.name.startswith("cache_s_l"):
+            roles[t.index] = f"cache_s_{t.name[len('cache_s_l'):]}"
+        elif t.name == "attn_scale":
+            roles[t.index] = "attn_scale"
 
     return roles
 
@@ -260,10 +267,21 @@ def synthesize_inputs(
     n_tokens = fixture.n_tokens
 
     feeds: dict[str, np.ndarray] = {}
+    assigned: set[str] = set()
+
+    def _pick_onnx_name(t) -> str | None:
+        base = fixture_name_to_onnx_input(t.name)
+        for name in onnx_input_names:
+            if name in assigned:
+                continue
+            if name == base or name.startswith(f"{base}_"):
+                return name
+        return None
+
     for leaf_idx, role in roles.items():
         t = dump.tensors[leaf_idx]
-        onnx_name = fixture_name_to_onnx_input(t.name)
-        if onnx_name not in onnx_input_names:
+        onnx_name = _pick_onnx_name(t)
+        if onnx_name is None:
             continue
         ne = [d for d in t.ne if d > 1] or [1]
         shape = list(reversed(ne))
@@ -284,11 +302,84 @@ def synthesize_inputs(
             k = np.arange(kv_total)[None, :]
             mask[(k <= q) & (k < n_tokens)] = 0.0
             arr = mask.reshape(shape).astype(np_dtype)
+        elif role == "attn_scale":
+            # ggml stores this as 1x1xN; ONNX keeps the singleton axes.
+            shape = list(reversed([int(d) for d in t.ne[:3]]))
+            # Mirrors llm_graph_input_attn_temp::set_input (llama-graph.cpp).
+            pos = np.arange(n_tokens, dtype=np.float32)
+            floor_scale, temp_scale, temp_offset = 8192.0, 0.1, 1.0
+            arr = (
+                np.log(np.floor((pos + temp_offset) / floor_scale) + 1.0) * temp_scale + 1.0
+            ).astype(np_dtype).reshape(shape)
         elif role.startswith("cache_"):
             arr = np.zeros(shape, dtype=np_dtype)
         else:
             arr = np.zeros(shape, dtype=np_dtype)
         feeds[onnx_name] = arr
+        assigned.add(onnx_name)
+
+    # Fill any remaining ONNX ports that map to gdump leaves (e.g. Mamba
+    # recurrent-state indices) that role identification does not cover yet.
+    leaf_by_onnx = {}
+    for t in dump.tensors:
+        if t.is_leaf or getattr(t, "is_input", False):
+            leaf_by_onnx[fixture_name_to_onnx_input(t.name)] = t
+    for name in onnx_input_names:
+        if name in feeds:
+            continue
+        t = leaf_by_onnx.get(name)
+        if t is None:
+            continue
+        ne = [d for d in t.ne if d > 1] or [1]
+        shape = list(reversed(ne))
+        feeds[name] = np.zeros(shape, dtype=_np_for(t.dtype))
+    return feeds
+
+
+def hwc_pixels_to_inp_raw(pixels: np.ndarray) -> np.ndarray:
+    """Convert HWC RGB fixture pixels to clip's unrolled ``inp_raw`` layout.
+
+    Layout mirrors ``clip_image_encode`` in ``tools/mtmd/clip.cpp``: three
+    stacked H×W planes for R, G, B.
+    """
+    if pixels.ndim != 3 or pixels.shape[-1] != 3:
+        raise ValueError(f"expected HWC RGB pixels, got shape {pixels.shape}")
+    h, w, _ = pixels.shape
+    n = h * w
+    out = np.empty((3 * n,), dtype=np.float32)
+    flat = pixels.reshape(n, 3)
+    out[0:n] = flat[:, 0]
+    out[n:2 * n] = flat[:, 1]
+    out[2 * n:3 * n] = flat[:, 2]
+    return out
+
+
+def synthesize_vision_inputs(
+    dump: gdump.GraphDump,
+    fixture: Fixture,
+    onnx_input_names: list[str],
+) -> dict[str, np.ndarray]:
+    """Build onnxruntime feeds for a vision encoder graph."""
+    if fixture.kind != "vision" or fixture.input_pixels is None:
+        raise ValueError("vision fixture required")
+
+    feeds: dict[str, np.ndarray] = {}
+    inp_raw = hwc_pixels_to_inp_raw(fixture.input_pixels.astype(np.float32))
+    for name in onnx_input_names:
+        t = next((x for x in dump.tensors if x.name == name), None)
+        if name == "inp_raw" or (t is not None and "inp_raw" in (t.name or "")):
+            ne = [d for d in (t.ne if t else [len(inp_raw)]) if d > 1] or [len(inp_raw)]
+            shape = list(reversed(ne))
+            count = 1
+            for d in shape:
+                count *= int(d)
+            feeds[name] = inp_raw[:count].reshape(shape).astype(np.float32)
+        elif t is not None:
+            ne = [d for d in t.ne if d > 1] or [1]
+            shape = list(reversed(ne))
+            feeds[name] = np.zeros(shape, dtype=_np_for(t.dtype))
+        else:
+            feeds[name] = np.zeros((len(inp_raw),), dtype=np.float32)
     return feeds
 
 
