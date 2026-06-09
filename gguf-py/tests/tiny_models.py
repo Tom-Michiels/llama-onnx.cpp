@@ -23,6 +23,8 @@ class TinyModel:
     # Extra GGUF metadata callbacks. Each entry is (writer-method, args).
     extra_kv: list = field(default_factory=list)
     tokenizer: str = "none"   # "none" -> llama.cpp skips tokenizer init
+    # Human-readable id for tests when multiple builders share the same arch.
+    label: str = ""
 
 
 def _rand(rng: np.random.Generator, shape, dtype=np.float32, scale=0.05):
@@ -32,6 +34,12 @@ def _rand(rng: np.random.Generator, shape, dtype=np.float32, scale=0.05):
 def _qkv_norm_tensors(weights, il, n_embd, head_dim, n_head, n_head_kv, dtype):
     weights[f"blk.{il}.attn_q_norm.weight"] = np.ones((head_dim,), dtype=dtype)
     weights[f"blk.{il}.attn_k_norm.weight"] = np.ones((head_dim,), dtype=dtype)
+
+
+def _qwen2_attn_biases(weights, rng, h, il, dtype):
+    weights[f"blk.{il}.attn_q.bias"] = _rand(rng, (h["n_head"]    * h["head_dim"],), dtype)
+    weights[f"blk.{il}.attn_k.bias"] = _rand(rng, (h["n_head_kv"] * h["head_dim"],), dtype)
+    weights[f"blk.{il}.attn_v.bias"] = _rand(rng, (h["n_head_kv"] * h["head_dim"],), dtype)
 
 
 def write_gguf(path: Path, m: TinyModel, *, dtype=np.float32) -> None:
@@ -79,7 +87,7 @@ def write_gguf(path: Path, m: TinyModel, *, dtype=np.float32) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _llama_like_weights(rng, h, dtype, *, with_qk_norm=False, with_moe=False):
+def _llama_like_weights(rng, h, dtype, *, with_qk_norm=False, with_moe=False, moe_style="qwen"):
     weights = {
         "token_embd.weight":   _rand(rng, (h["vocab_size"], h["n_embd"]), dtype),
         "output_norm.weight":  np.ones((h["n_embd"],), dtype=dtype),
@@ -95,7 +103,10 @@ def _llama_like_weights(rng, h, dtype, *, with_qk_norm=False, with_moe=False):
             _qkv_norm_tensors(weights, il, h["n_embd"], h["head_dim"], h["n_head"], h["n_head_kv"], dtype)
         if with_moe:
             n_exp = h["n_expert"]
-            n_ff_exp = h.get("n_ff_exp", h["n_ff"] // h.get("n_expert_used", 1))
+            if moe_style == "llama":
+                n_ff_exp = h["n_ff"]
+            else:
+                n_ff_exp = h.get("n_ff_exp", h["n_ff"] // h.get("n_expert_used", 1))
             weights[f"blk.{il}.ffn_gate_inp.weight"]  = _rand(rng, (n_exp, h["n_embd"]), dtype)
             weights[f"blk.{il}.ffn_gate_exps.weight"] = _rand(rng, (n_exp, n_ff_exp, h["n_embd"]), dtype)
             weights[f"blk.{il}.ffn_up_exps.weight"]   = _rand(rng, (n_exp, n_ff_exp, h["n_embd"]), dtype)
@@ -104,6 +115,32 @@ def _llama_like_weights(rng, h, dtype, *, with_qk_norm=False, with_moe=False):
             weights[f"blk.{il}.ffn_gate.weight"] = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
             weights[f"blk.{il}.ffn_up.weight"]   = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
             weights[f"blk.{il}.ffn_down.weight"] = _rand(rng, (h["n_embd"], h["n_ff"]), dtype)
+    return weights
+
+
+def _phi3_like_weights(rng, h, dtype):
+    """Phi-3: SWIGLU via merged ffn_up (2*n_ff); no ffn_gate."""
+    weights = {
+        "token_embd.weight":   _rand(rng, (h["vocab_size"], h["n_embd"]), dtype),
+        "output_norm.weight":  np.ones((h["n_embd"],), dtype=dtype),
+    }
+    for il in range(h["n_layer"]):
+        weights[f"blk.{il}.attn_norm.weight"]   = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.attn_q.weight"]      = _rand(rng, (h["n_head"]    * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_k.weight"]      = _rand(rng, (h["n_head_kv"] * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_v.weight"]      = _rand(rng, (h["n_head_kv"] * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_output.weight"] = _rand(rng, (h["n_embd"], h["n_head"] * h["head_dim"]), dtype)
+        weights[f"blk.{il}.ffn_norm.weight"]    = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.ffn_up.weight"]      = _rand(rng, (2 * h["n_ff"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.ffn_down.weight"]    = _rand(rng, (h["n_embd"], h["n_ff"]), dtype)
+    return weights
+
+
+def _gemma2_like_weights(rng, h, dtype):
+    weights = _llama_like_weights(rng, h, dtype)
+    for il in range(h["n_layer"]):
+        weights[f"blk.{il}.post_attention_norm.weight"] = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.post_ffw_norm.weight"]       = np.ones((h["n_embd"],), dtype=dtype)
     return weights
 
 
@@ -193,7 +230,258 @@ def tiny_qwen2vl(seed=46, *, dtype=np.float32) -> TinyModel:
     # qwen2vl uses Q/K/V biases by default (qwen2 family convention).
     weights = _llama_like_weights(rng, h, dtype)
     for il in range(h["n_layer"]):
-        weights[f"blk.{il}.attn_q.bias"] = _rand(rng, (h["n_head"]    * h["head_dim"],), dtype)
-        weights[f"blk.{il}.attn_k.bias"] = _rand(rng, (h["n_head_kv"] * h["head_dim"],), dtype)
-        weights[f"blk.{il}.attn_v.bias"] = _rand(rng, (h["n_head_kv"] * h["head_dim"],), dtype)
+        _qwen2_attn_biases(weights, rng, h, il, dtype)
     return TinyModel(arch="qwen2vl", hparams=h, weights=weights)
+
+
+def tiny_qwen2(seed=48, *, dtype=np.float32) -> TinyModel:
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-6, rope_base=1_000_000.0)
+    weights = _llama_like_weights(rng, h, dtype)
+    for il in range(h["n_layer"]):
+        _qwen2_attn_biases(weights, rng, h, il, dtype)
+    return TinyModel(arch="qwen2", hparams=h, weights=weights)
+
+
+def tiny_phi3(seed=49, *, dtype=np.float32) -> TinyModel:
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=4, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10_000.0)
+    return TinyModel(arch="phi3", hparams=h, weights=_phi3_like_weights(rng, h, dtype))
+
+
+def tiny_mixtral(seed=50, *, dtype=np.float32) -> TinyModel:
+    """Mixtral-8x7B-style MoE; GGUF arch is ``llama`` (n_expert > 0)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=1_000_000.0,
+             n_expert=4, n_expert_used=2)
+    return TinyModel(arch="llama", label="mixtral", hparams=h,
+                     weights=_llama_like_weights(rng, h, dtype, with_moe=True, moe_style="llama"))
+
+
+def tiny_pixtral(seed=53, *, dtype=np.float32) -> TinyModel:
+    """Pixtral-12B text backbone (standard ``llama`` arch, no vision tensors)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=1_000_000.0)
+    return TinyModel(arch="llama", label="pixtral", hparams=h,
+                     weights=_llama_like_weights(rng, h, dtype))
+
+
+def tiny_internvl(seed=54, *, dtype=np.float32) -> TinyModel:
+    """InternVL text backbone (``internlm2`` LM graph, no vision tensors)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10_000.0)
+    weights = _llama_like_weights(rng, h, dtype)
+    weights["output.weight"] = _rand(rng, (h["vocab_size"], h["n_embd"]), dtype)
+    return TinyModel(arch="internlm2", label="internvl", hparams=h, weights=weights)
+
+
+def tiny_internlm2(seed=51, *, dtype=np.float32) -> TinyModel:
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10_000.0)
+    weights = _llama_like_weights(rng, h, dtype)
+    weights["output.weight"] = _rand(rng, (h["vocab_size"], h["n_embd"]), dtype)
+    return TinyModel(arch="internlm2", hparams=h, weights=weights)
+
+
+def tiny_gemma2(seed=52, *, dtype=np.float32) -> TinyModel:
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-6, rope_base=10_000.0)
+    extra_kv = [
+        ("add_sliding_window", [64]),
+        ("add_sliding_window_pattern", [2]),
+    ]
+    return TinyModel(arch="gemma2", hparams=h,
+                     weights=_gemma2_like_weights(rng, h, dtype), extra_kv=extra_kv)
+
+
+# ---------------------------------------------------------------------------
+# VLM LM-side backends (text backbone only; no vision encoder tensors)
+# ---------------------------------------------------------------------------
+
+
+def tiny_qwen3vl(seed=56, *, dtype=np.float32) -> TinyModel:
+    """Qwen3-VL text backbone (IM-RoPE + deepstack + Q/K norms)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-6, rope_base=1_000_000.0,
+             rope_sections=[1, 0, 1, 0], n_deepstack_layers=1)
+    extra_kv = [("add_num_deepstack_layers", [h["n_deepstack_layers"]])]
+    return TinyModel(arch="qwen3vl", hparams=h,
+                     weights=_llama_like_weights(rng, h, dtype, with_qk_norm=True),
+                     extra_kv=extra_kv)
+
+
+def _llama4_weights(rng, h, dtype):
+    weights = {
+        "token_embd.weight":   _rand(rng, (h["vocab_size"], h["n_embd"]), dtype),
+        "output_norm.weight":  np.ones((h["n_embd"],), dtype=dtype),
+    }
+    n_exp = h["n_expert"]
+    n_ff_exp = h["n_ff_exp"]
+    moe_step = h["n_moe_layer_step"]
+    for il in range(h["n_layer"]):
+        weights[f"blk.{il}.attn_norm.weight"]   = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.attn_q.weight"]      = _rand(rng, (h["n_head"]    * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_k.weight"]      = _rand(rng, (h["n_head_kv"] * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_v.weight"]      = _rand(rng, (h["n_head_kv"] * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_output.weight"] = _rand(rng, (h["n_embd"], h["n_head"] * h["head_dim"]), dtype)
+        weights[f"blk.{il}.ffn_norm.weight"]    = np.ones((h["n_embd"],), dtype=dtype)
+        if moe_step > 0 and (il + 1) % moe_step == 0:
+            weights[f"blk.{il}.ffn_gate_inp.weight"]   = _rand(rng, (n_exp, h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_gate_exps.weight"]  = _rand(rng, (n_exp, n_ff_exp, h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_up_exps.weight"]    = _rand(rng, (n_exp, n_ff_exp, h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_down_exps.weight"]  = _rand(rng, (n_exp, h["n_embd"], n_ff_exp), dtype)
+            weights[f"blk.{il}.ffn_gate_shexp.weight"]  = _rand(rng, (n_ff_exp, h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_up_shexp.weight"]   = _rand(rng, (n_ff_exp, h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_down_shexp.weight"] = _rand(rng, (h["n_embd"], n_ff_exp), dtype)
+        else:
+            weights[f"blk.{il}.ffn_gate.weight"] = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_up.weight"]   = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
+            weights[f"blk.{il}.ffn_down.weight"] = _rand(rng, (h["n_embd"], h["n_ff"]), dtype)
+    return weights
+
+
+def tiny_llama4(seed=57, *, dtype=np.float32) -> TinyModel:
+    """Llama 4 Scout/Maverick text backbone (interleaved MoE + shared experts)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=4, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=500_000.0,
+             n_expert=4, n_expert_used=2, n_ff_exp=8, n_moe_layer_step=2)
+    extra_kv = [
+        ("add_expert_feed_forward_length", [h["n_ff_exp"]]),
+        ("add_interleave_moe_layer_step",  [h["n_moe_layer_step"]]),
+        ("add_sliding_window",             [0]),
+    ]
+    return TinyModel(arch="llama4", hparams=h,
+                     weights=_llama4_weights(rng, h, dtype), extra_kv=extra_kv)
+
+
+def _cogvlm_weights(rng, h, dtype):
+    n_qkv = h["n_head"] * h["head_dim"] * 3
+    weights = {
+        "token_embd.weight":   _rand(rng, (h["vocab_size"], h["n_embd"]), dtype),
+        "output_norm.weight":  np.ones((h["n_embd"],), dtype=dtype),
+    }
+    for il in range(h["n_layer"]):
+        weights[f"blk.{il}.attn_norm.weight"]       = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.attn_qkv.weight"]        = _rand(rng, (n_qkv, h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_output.weight"]     = _rand(rng, (h["n_embd"], h["n_head"] * h["head_dim"]), dtype)
+        weights[f"blk.{il}.vis_attn_qkv.weight"]    = _rand(rng, (n_qkv, h["n_embd"]), dtype)
+        weights[f"blk.{il}.vis_attn_output.weight"] = _rand(rng, (h["n_embd"], h["n_head"] * h["head_dim"]), dtype)
+        weights[f"blk.{il}.ffn_norm.weight"]        = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.ffn_gate.weight"]       = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.ffn_up.weight"]         = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.ffn_down.weight"]       = _rand(rng, (h["n_embd"], h["n_ff"]), dtype)
+        weights[f"blk.{il}.vis_gate.weight"]       = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.vis_up.weight"]         = _rand(rng, (h["n_ff"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.vis_down.weight"]       = _rand(rng, (h["n_embd"], h["n_ff"]), dtype)
+    return weights
+
+
+def tiny_cogvlm(seed=58, *, dtype=np.float32) -> TinyModel:
+    """CogVLM LM graph (text + vis-expert weight paths)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=4, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10000.0)
+    return TinyModel(arch="cogvlm", hparams=h, weights=_cogvlm_weights(rng, h, dtype))
+
+
+def tiny_minicpm(seed=59, *, dtype=np.float32) -> TinyModel:
+    """MiniCPM-V text backbone (granite-style embedding/residual/logit scaling)."""
+    rng = np.random.default_rng(seed)
+    n_layer = 2
+    h = dict(n_layer=n_layer, n_embd=16, n_ff=32, n_head=4, n_head_kv=4, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10000.0)
+    extra_kv = [
+        ("add_embedding_scale", [12.0]),
+        ("add_residual_scale",  [1.4 / (n_layer ** 0.5)]),
+        ("add_logit_scale",     [256.0 / h["n_embd"]]),
+    ]
+    return TinyModel(arch="minicpm", label="minicpm-v", hparams=h,
+                     weights=_llama_like_weights(rng, h, dtype), extra_kv=extra_kv)
+
+
+def _glm4_weights(rng, h, dtype):
+    weights = {
+        "token_embd.weight":   _rand(rng, (h["vocab_size"], h["n_embd"]), dtype),
+        "output_norm.weight":  np.ones((h["n_embd"],), dtype=dtype),
+    }
+    for il in range(h["n_layer"]):
+        weights[f"blk.{il}.attn_norm.weight"]           = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.attn_q.weight"]              = _rand(rng, (h["n_head"]    * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_k.weight"]              = _rand(rng, (h["n_head_kv"] * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_v.weight"]              = _rand(rng, (h["n_head_kv"] * h["head_dim"], h["n_embd"]), dtype)
+        weights[f"blk.{il}.attn_output.weight"]         = _rand(rng, (h["n_embd"], h["n_head"] * h["head_dim"]), dtype)
+        weights[f"blk.{il}.post_attention_norm.weight"] = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.ffn_norm.weight"]              = np.ones((h["n_embd"],), dtype=dtype)
+        weights[f"blk.{il}.ffn_up.weight"]              = _rand(rng, (h["n_ff"] * 2, h["n_embd"]), dtype)
+        weights[f"blk.{il}.ffn_down.weight"]            = _rand(rng, (h["n_embd"], h["n_ff"]), dtype)
+        weights[f"blk.{il}.post_ffw_norm.weight"]       = np.ones((h["n_embd"],), dtype=dtype)
+    return weights
+
+
+def tiny_glm4(seed=60, *, dtype=np.float32) -> TinyModel:
+    """GLM-4 text backbone (non-multimodal)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10000.0)
+    return TinyModel(arch="glm4", hparams=h, weights=_glm4_weights(rng, h, dtype))
+
+
+def tiny_glm4v(seed=61, *, dtype=np.float32) -> TinyModel:
+    """GLM-4V text backbone (glm4 arch with M-RoPE for image token positions)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=2, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10000.0, n_rot=2,
+             rope_sections=[1, 1, 0, 0])
+    return TinyModel(arch="glm4", label="glm4v", hparams=h, weights=_glm4_weights(rng, h, dtype))
+
+
+def _minicpm3_weights(rng, h, dtype):
+    n_embd = h["n_embd"]
+    n_head = h["n_head"]
+    head_dim = h["head_dim"]
+    n_rot = h["n_rot"]
+    q_rank = h["q_lora_rank"]
+    kv_rank = h["kv_lora_rank"]
+    n_qk_nope = head_dim - n_rot
+    n_v = head_dim
+    weights = {
+        "token_embd.weight":   _rand(rng, (h["vocab_size"], n_embd), dtype),
+        "output_norm.weight":  np.ones((n_embd,), dtype=dtype),
+    }
+    for il in range(h["n_layer"]):
+        weights[f"blk.{il}.attn_norm.weight"]      = np.ones((n_embd,), dtype=dtype)
+        weights[f"blk.{il}.attn_q_a_norm.weight"]  = np.ones((q_rank,), dtype=dtype)
+        weights[f"blk.{il}.attn_kv_a_norm.weight"] = np.ones((kv_rank,), dtype=dtype)
+        weights[f"blk.{il}.attn_q_a.weight"]       = _rand(rng, (q_rank, n_embd), dtype)
+        weights[f"blk.{il}.attn_q_b.weight"]       = _rand(rng, (n_head * head_dim, q_rank), dtype)
+        weights[f"blk.{il}.attn_kv_a_mqa.weight"]  = _rand(rng, (kv_rank + n_rot, n_embd), dtype)
+        weights[f"blk.{il}.attn_kv_b.weight"]      = _rand(rng, (n_head * (n_qk_nope + n_v), kv_rank), dtype)
+        weights[f"blk.{il}.attn_output.weight"]    = _rand(rng, (n_embd, n_head * n_v), dtype)
+        weights[f"blk.{il}.ffn_norm.weight"]       = np.ones((n_embd,), dtype=dtype)
+        weights[f"blk.{il}.ffn_gate.weight"]       = _rand(rng, (h["n_ff"], n_embd), dtype)
+        weights[f"blk.{il}.ffn_up.weight"]         = _rand(rng, (h["n_ff"], n_embd), dtype)
+        weights[f"blk.{il}.ffn_down.weight"]       = _rand(rng, (n_embd, h["n_ff"]), dtype)
+    return weights
+
+
+def tiny_minicpm3(seed=62, *, dtype=np.float32) -> TinyModel:
+    """MiniCPM3 / MiniCPM-V 4.x text backbone (MLA-style attention)."""
+    rng = np.random.default_rng(seed)
+    h = dict(n_layer=2, n_embd=16, n_ff=32, n_head=4, n_head_kv=4, head_dim=4,
+             vocab_size=32, rms_eps=1e-5, rope_base=10000.0,
+             n_rot=4, q_lora_rank=4, kv_lora_rank=4)
+    extra_kv = [
+        ("add_q_lora_rank",  [h["q_lora_rank"]]),
+        ("add_kv_lora_rank", [h["kv_lora_rank"]]),
+    ]
+    return TinyModel(arch="minicpm3", hparams=h,
+                     weights=_minicpm3_weights(rng, h, dtype), extra_kv=extra_kv)
