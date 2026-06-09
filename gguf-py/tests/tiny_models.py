@@ -357,7 +357,6 @@ def tiny_llama4(seed=57, *, dtype=np.float32) -> TinyModel:
     extra_kv = [
         ("add_expert_feed_forward_length", [h["n_ff_exp"]]),
         ("add_interleave_moe_layer_step",  [h["n_moe_layer_step"]]),
-        ("add_sliding_window",             [0]),
     ]
     return TinyModel(arch="llama4", hparams=h,
                      weights=_llama4_weights(rng, h, dtype), extra_kv=extra_kv)
@@ -471,6 +470,103 @@ def _minicpm3_weights(rng, h, dtype):
         weights[f"blk.{il}.ffn_up.weight"]         = _rand(rng, (h["n_ff"], n_embd), dtype)
         weights[f"blk.{il}.ffn_down.weight"]       = _rand(rng, (n_embd, h["n_ff"]), dtype)
     return weights
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder (mmproj) builders
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TinyMmproj:
+    """Synthetic CLIP / mmproj record for vision-only ONNX export tests."""
+    hparams: dict
+    weights: dict
+    label: str = "idefics3"
+
+
+def _siglip_vit_weights(rng, h, dtype, *, prefix="v"):
+    """Minimal SigLIP-style ViT tensors for idefics3 / SmolVLM projector tests."""
+    n_embd = h["n_embd"]
+    n_head = h["n_head"]
+    d_head = h["head_dim"]
+    n_ff = h["n_ff"]
+    n_patches = h["n_patches"]
+    patch = h["patch_size"]
+    weights = {
+        # PyTorch Conv2d layout (out_ch, in_ch, kH, kW); gguf stores as ggml [kw,kh,cin,cout].
+        f"{prefix}.patch_embd.weight": _rand(rng, (n_embd, 3, patch, patch), dtype),
+        f"{prefix}.position_embd.weight": _rand(rng, (n_patches, n_embd), dtype),
+    }
+    for il in range(h["n_layer"]):
+        # Fused QKV (SigLIP path in clip.cpp).
+        weights[f"{prefix}.blk.{il}.attn_qkv.weight"] = _rand(
+            rng, (3 * n_head * d_head, n_embd), dtype)
+        weights[f"{prefix}.blk.{il}.attn_out.weight"] = _rand(
+            rng, (n_embd, n_head * d_head), dtype)
+        weights[f"{prefix}.blk.{il}.ln1.weight"] = np.ones((n_embd,), dtype=dtype)
+        weights[f"{prefix}.blk.{il}.ln1.bias"] = np.zeros((n_embd,), dtype=dtype)
+        weights[f"{prefix}.blk.{il}.ln2.weight"] = np.ones((n_embd,), dtype=dtype)
+        weights[f"{prefix}.blk.{il}.ln2.bias"] = np.zeros((n_embd,), dtype=dtype)
+        # SigLIP stores the FFN matrices swapped on disk (clip.cpp swaps on load).
+        weights[f"{prefix}.blk.{il}.ffn_up.weight"] = _rand(rng, (n_embd, n_ff), dtype)
+        weights[f"{prefix}.blk.{il}.ffn_down.weight"] = _rand(rng, (n_ff, n_embd), dtype)
+    return weights
+
+
+def write_mmproj_gguf(path: Path, m: TinyMmproj, *, dtype=np.float32) -> None:
+    w = GGUFWriter(path, "clip")
+    h = m.hparams
+    w.add_clip_has_vision_encoder(True)
+    w.add_clip_has_audio_encoder(False)
+    w.add_clip_projector_type("idefics3")
+    w.add_vision_embedding_length(h["n_embd"])
+    w.add_vision_feed_forward_length(h["n_ff"])
+    w.add_vision_block_count(h["n_layer"])
+    w.add_vision_head_count(h["n_head"])
+    w.add_vision_attention_layernorm_eps(h["eps"])
+    w.add_vision_image_size(h["image_size"])
+    w.add_vision_patch_size(h["patch_size"])
+    w.add_vision_projection_dim(h["proj_dim"])
+    w.add_vision_projector_scale_factor(h["n_merge"])
+    w.add_vision_image_mean([0.5, 0.5, 0.5])
+    w.add_vision_image_std([0.5, 0.5, 0.5])
+    w.add_vision_use_gelu(True)
+    for name, arr in m.weights.items():
+        w.add_tensor(name, arr.astype(dtype))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def tiny_idefics3_mmproj(seed=70, *, dtype=np.float32) -> TinyMmproj:
+    """Tiny idefics3/SigLIP mmproj (SmolVLM-style pixel-shuffle projector)."""
+    rng = np.random.default_rng(seed)
+    image_size = 8
+    patch_size = 4
+    n_merge = 2
+    n_side = image_size // patch_size
+    n_patches = n_side * n_side
+    n_embd = 16
+    h = dict(
+        image_size=image_size,
+        patch_size=patch_size,
+        n_merge=n_merge,
+        n_patches=n_patches,
+        n_layer=1,
+        n_embd=n_embd,
+        n_head=2,
+        head_dim=8,
+        n_ff=32,
+        eps=1e-6,
+        proj_dim=16,
+    )
+    weights = _siglip_vit_weights(rng, h, dtype)
+    # After pixel-shuffle: n_embd * n_merge^2 features per output token.
+    mm_in = n_embd * n_merge * n_merge
+    weights["mm.model.fc.weight"] = _rand(rng, (h["proj_dim"], mm_in), dtype)
+    return TinyMmproj(hparams=h, weights=weights, label="idefics3")
 
 
 def tiny_minicpm3(seed=62, *, dtype=np.float32) -> TinyModel:

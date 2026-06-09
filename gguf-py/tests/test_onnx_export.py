@@ -27,11 +27,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gguf.gdump_to_onnx import convert as gdump_to_onnx
 from tiny_models import (
-    write_gguf,
+    write_gguf, write_mmproj_gguf,
     tiny_llama, tiny_gemma, tiny_gemma2, tiny_qwen2, tiny_qwen3, tiny_qwen3moe,
     tiny_phi3, tiny_mamba, tiny_mixtral, tiny_internlm2, tiny_glm4, tiny_minicpm3,
     tiny_qwen2vl, tiny_cogvlm, tiny_minicpm, tiny_pixtral, tiny_internvl,
     tiny_qwen3vl, tiny_llama4, tiny_glm4v,
+    tiny_idefics3_mmproj,
 )
 
 
@@ -64,18 +65,15 @@ POPULAR_MODELS = [
     ("glm4v",     tiny_glm4v),
 ]
 
-# Known ONNX translator / fixture-synthesis gaps. Tests stay in the matrix so
-# regressions are obvious once support lands.
-PIPELINE_GAPS = {
-    "gemma2":  "FLASH_ATTN_EXT with Gemma2 logit softcap",
-    "qwen3vl": "IMROPE (rope mode 40)",
-    "llama4":  "interleaved MoE + shared-expert shape inference",
-    "glm4v":   "partial M-RoPE (n_rot < head_dim)",
-}
-FIXTURE_GAPS = {
-    **PIPELINE_GAPS,
-    "mamba": "fixture input synthesis for SSM recurrent state",
-}
+# Known ONNX translator / fixture-synthesis gaps (empty when all models pass).
+PIPELINE_GAPS: dict[str, str] = {}
+FIXTURE_GAPS: dict[str, str] = {}
+
+# Vision encoder mmproj families (full encoder graph, not LM text backbones).
+POPULAR_VISION_MMPROJ = [
+    ("idefics3", tiny_idefics3_mmproj),
+]
+VISION_FIXTURE_GAPS: dict[str, str] = {}
 
 
 def _model_id(m) -> str:
@@ -178,6 +176,54 @@ class TestOnnxExportPipeline(unittest.TestCase):
             self.assertLess(np.abs(onnx_logits - fx.logits).max(), max_abs_diff,
                 f"{tag}: max abs diff between ONNX and llama_decode logits exceeds {max_abs_diff}")
 
+    def _run_vision_fixture_comparison(self, mmproj_builder, *, max_abs_diff=5e-3, min_cos=0.999):
+        """Compare ONNX vision encoder output against clip CPU reference features."""
+        from gguf import gdump
+        from gguf.gdump_fixture import load as load_fx, synthesize_vision_inputs
+
+        m = mmproj_builder()
+        tag = m.label or "vision"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            gguf_path = tmp / f"tiny_{tag}.gguf"
+            dump_path = tmp / f"tiny_{tag}.vision.gdump"
+            fx_path   = tmp / f"tiny_{tag}.gfxt"
+            onnx_path = tmp / f"tiny_{tag}.vision.onnx"
+
+            write_mmproj_gguf(gguf_path, m)
+
+            env = os.environ.copy()
+            env.setdefault("LD_LIBRARY_PATH", str(self.dumper.parent))
+            subprocess.run(
+                [str(self.dumper), "-m", str(gguf_path), "-o", "/dev/null",
+                 "--vision-only", "--vision-dump", str(dump_path),
+                 "--vision-fixture", str(fx_path)],
+                env=env, check=True, capture_output=True,
+            )
+            self.assertTrue(dump_path.is_file())
+            self.assertTrue(fx_path.is_file())
+
+            gdump_to_onnx(dump_path, onnx_path, weight_dtype="float32")
+            import onnxruntime as ort
+            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            d = gdump.load(dump_path)
+            fx = load_fx(fx_path)
+            self.assertEqual(fx.kind, "vision")
+            feeds = synthesize_vision_inputs(d, fx, [i.name for i in sess.get_inputs()])
+            out_names = [o.name for o in sess.get_outputs()]
+            out_name = fx.output_name if fx.output_name in out_names else out_names[0]
+            (onnx_out,) = sess.run([out_name], feeds)
+            ref = fx.output_features
+            self.assertEqual(onnx_out.size, ref.size)
+
+            a = onnx_out.reshape(-1)
+            b = ref.reshape(-1)
+            from numpy.linalg import norm
+            cos = float((a * b).sum() / (norm(a) * norm(b) + 1e-12))
+            self.assertGreater(cos, min_cos, f"{tag}: vision cosine too low: {cos:.4f}")
+            self.assertLess(np.abs(a - b).max(), max_abs_diff,
+                f"{tag}: vision max abs diff exceeds {max_abs_diff}")
+
     def test_llama_quantised_q4_0(self):
         """Round-trip a quantised GGUF through dequantise + fp16 ONNX."""
         try:
@@ -265,6 +311,14 @@ def _make_popular_fixture_test(label, builder):
     return test
 
 
+def _make_vision_fixture_test(label, builder):
+    def test(self):
+        _run_maybe_gap(self, label, VISION_FIXTURE_GAPS,
+                       lambda: self._run_vision_fixture_comparison(builder))
+    test.__doc__ = f"ONNX vs clip vision features for mmproj family: {label}"
+    return test
+
+
 for _label, _builder in POPULAR_MODELS:
     setattr(
         TestOnnxExportPipeline,
@@ -275,6 +329,13 @@ for _label, _builder in POPULAR_MODELS:
         TestOnnxExportPipeline,
         f"test_popular_fixture_{_label}",
         _make_popular_fixture_test(_label, _builder),
+    )
+
+for _label, _builder in POPULAR_VISION_MMPROJ:
+    setattr(
+        TestOnnxExportPipeline,
+        f"test_vision_fixture_{_label}",
+        _make_vision_fixture_test(_label, _builder),
     )
 
 
