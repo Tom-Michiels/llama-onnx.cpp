@@ -185,31 +185,18 @@ class TestOnnxExportPipeline(unittest.TestCase):
             self.assertTrue(any("Q4_0" in s for s in doc_strings),
                             "expected at least one initializer tagged with original_ggml_type=Q4_0")
 
-    def test_llama_fixture_comparison(self):
-        """End-to-end comparison: ONNX vs reference logits from llama_decode.
-
-        The C++ dumper writes a fixture with reference logits produced by
-        ``llama_decode`` on a deterministic token stream. We run the
-        exported ONNX over the same inputs (synthesised in Python from the
-        gdump's graph structure) and check we agree at least directionally.
-        The full bit-exact convergence is a follow-up; the synthetic random
-        weights here compound any per-op rounding across the whole graph.
-        """
-        try:
-            import onnxruntime as ort  # noqa: F401
-        except ImportError:
-            self.skipTest("onnxruntime not installed")
-
+    def _run_fixture_comparison(self, model_builder, *, max_abs_diff=5e-3, min_cos=0.999):
+        """Run ONNX against the same inputs as a llama_decode fixture."""
         from gguf import gdump
         from gguf.gdump_fixture import load as load_fx, synthesize_inputs
 
-        m = tiny_llama()
+        m = model_builder()
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
-            gguf_path = tmp / "tiny.gguf"
-            dump_path = tmp / "tiny.gdump"
-            fx_path   = tmp / "tiny.gfxt"
-            onnx_path = tmp / "tiny.onnx"
+            gguf_path = tmp / f"tiny_{m.arch}.gguf"
+            dump_path = tmp / f"tiny_{m.arch}.gdump"
+            fx_path   = tmp / f"tiny_{m.arch}.gfxt"
+            onnx_path = tmp / f"tiny_{m.arch}.onnx"
 
             from tiny_models import write_gguf
             write_gguf(gguf_path, m)
@@ -223,6 +210,7 @@ class TestOnnxExportPipeline(unittest.TestCase):
 
             # Export with fp32 weights to maximise numerical agreement.
             gdump_to_onnx(dump_path, onnx_path, weight_dtype="float32")
+            import onnxruntime as ort
             sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
             d = gdump.load(dump_path)
             fx = load_fx(fx_path)
@@ -230,15 +218,36 @@ class TestOnnxExportPipeline(unittest.TestCase):
             (onnx_logits,) = sess.run(["logits"], feeds)
             self.assertEqual(onnx_logits.shape, fx.logits.shape)
 
-            # With fp32 weights the two paths agree bitwise modulo fp32
-            # rounding (sums of products in slightly different orders), so
-            # we can assert tight absolute & cosine tolerances.
             from numpy.linalg import norm
             cos = (onnx_logits * fx.logits).sum(axis=-1) / (norm(onnx_logits, axis=-1) * norm(fx.logits, axis=-1) + 1e-12)
-            self.assertGreater(cos.min(), 0.999,
-                f"per-row cosine min too low: {cos.min():.4f}")
-            self.assertLess(np.abs(onnx_logits - fx.logits).max(), 5e-3,
-                "max abs diff between ONNX and llama_decode logits exceeds 5e-3")
+            self.assertGreater(cos.min(), min_cos,
+                f"{m.arch}: per-row cosine min too low: {cos.min():.4f}")
+            self.assertLess(np.abs(onnx_logits - fx.logits).max(), max_abs_diff,
+                f"{m.arch}: max abs diff between ONNX and llama_decode logits exceeds {max_abs_diff}")
+
+    def test_llama_fixture_comparison(self):
+        """End-to-end comparison: ONNX vs reference logits from llama_decode.
+
+        The C++ dumper writes a fixture with reference logits produced by
+        ``llama_decode`` on a deterministic token stream. We run the
+        exported ONNX over the same inputs (synthesised in Python from the
+        gdump's graph structure) and check the logits closely agree.
+        """
+        try:
+            import onnxruntime as ort  # noqa: F401
+        except ImportError:
+            self.skipTest("onnxruntime not installed")
+
+        self._run_fixture_comparison(tiny_llama)
+
+    def test_qwen2vl_fixture_comparison(self):
+        """Qwen2-VL LM graph: ONNX logits vs original llama_decode logits."""
+        try:
+            import onnxruntime as ort  # noqa: F401
+        except ImportError:
+            self.skipTest("onnxruntime not installed")
+
+        self._run_fixture_comparison(tiny_qwen2vl)
 
 
 if __name__ == "__main__":
