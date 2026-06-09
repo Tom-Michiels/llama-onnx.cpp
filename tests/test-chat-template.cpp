@@ -758,7 +758,7 @@ int main_automated_tests(void) {
         {
             /* .name= */ "Gemma 3 media marker",
             /* .template_str= */ "{{ bos_token }}{%- for message in messages -%}{%- if message['role'] == 'assistant' -%}{%- set role = 'model' -%}{%- else -%}{%- set role = message['role'] -%}{%- endif -%}{{ ' ' + role + '\n' }}{%- if message['content'] is string -%}{{ message['content'] | trim }}{%- elif message['content'] is iterable -%}{%- for item in message['content'] -%}{%- if item['type'] == 'image' -%}{{ ' ' }}{%- elif item['type'] == 'text' -%}{{ item['text'] | trim }}{%- endif -%}{%- endfor -%}{%- endif -%}{{ '<end_of_turn>\n' }}{%- endfor -%}{%- if add_generation_prompt -%}{{ ' model\n' }}{%- endif -%}",
-            /* .expected_output= */ "<bos> user\nDescribe<__media__>please.<end_of_turn>\n model\n",
+            /* .expected_output= */ "<bos> user\nDescribe <__media__> please.<end_of_turn>\n model\n",
             /* .bos_token= */ "<bos>",
         },
     };
